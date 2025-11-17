@@ -8,11 +8,28 @@ checks and restarts behave the same way they do in production.
 
 ```bash
 chmod +x singbox-manage.py
-./singbox-manage.py [--config PATH] [--clients-table PATH] [--vless-tag TAG] [--container NAME]
+./singbox-manage.py [--config PATH] [--clients-table PATH]
 ```
 
-Defaults: `/opt/singbox/{config.json,clientsTable.json}`, VLESS tag `vless-in`, container name
-`singbox`.
+Defaults: `/opt/singbox/{config.json,clientsTable.json}`; VLESS tag and container are read from
+`singbox-manage.toml` (see below) or fall back to `vless-in` / `singbox` if the file/keys are
+missing.
+
+### Settings file
+
+Copy `settings.example.toml` to `singbox-manage.toml` and tweak the values:
+
+```toml
+vless_tag = "vless-in"
+container = "singbox"
+docker_image = "ghcr.io/sagernet/sing-box:latest"
+```
+
+All keys are optional; omit any line to fall back to the defaults above. They control:
+
+- `vless_tag`: Which inbound's users array is synced.
+- `container`: Container restarted by `S`/`x`.
+- `docker_image`: Image pulled for the `docker run ... check` command.
 
 ## Why use it?
 
