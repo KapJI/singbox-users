@@ -8,7 +8,7 @@ checks and restarts behave the same way they do in production.
 
 ```bash
 chmod +x singbox-manage.py
-./singbox-manage.py [--config PATH] [--table PATH] [--vless-tag TAG] [--container NAME]
+./singbox-manage.py [--config PATH] [--clients-table PATH] [--vless-tag TAG] [--container NAME]
 ```
 
 Defaults: `/opt/singbox/{config.json,clientsTable.json}`, VLESS tag `vless-in`, container name

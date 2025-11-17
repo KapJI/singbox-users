@@ -16,8 +16,10 @@ Notes:
 """
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
+import contextlib
 import curses
+from dataclasses import dataclass
 from datetime import datetime
 import json
 from pathlib import Path
@@ -33,6 +35,45 @@ DEFAULT_TAG = "vless-in"
 DEFAULT_FLOW = "xtls-rprx-vision"
 DEFAULT_CONTAINER = "singbox"
 KEY_BYTE_MAX = 256  # upper bound for single-byte key values
+CTRL_A = 1
+CTRL_E = 5
+CTRL_K = 11
+CTRL_U = 21
+
+with contextlib.suppress(AttributeError):
+    curses.set_escdelay(25)  # lower ESC detection delay for snappier cancel
+
+CATPPUCCIN_MOCHA = {
+    "rosewater": "f5e0dc",
+    "lavender": "b4befe",
+    "peach": "fab387",
+    "text": "cdd6f4",
+    "surface1": "45475a",
+    "panel_bg": "313244",
+    "input_bg": "585b70",
+    "cursor_bg": "f38ba8",
+    "cursor_fg": "11111b",
+    "base": "1e1e2e",
+}
+
+
+@dataclass(frozen=True)
+class CommandBinding:
+    """Registry entry describing a keyboard shortcut and its behavior."""
+
+    display: str
+    keys: tuple[int, ...]
+    handler: Callable[[], bool]
+    show_in_help: bool = True
+
+
+@dataclass
+class ModalSpec:
+    """Declarative description of a simple modal window."""
+
+    header: str
+    body_lines: Sequence[str]
+    footer: str | None = None
 
 
 class ClientUserData(TypedDict, total=False):
@@ -347,94 +388,648 @@ class App:
                 pass
 
         self.cursor = 0
+        self.view_top = 0
         self.message = "Loaded."
         self.dirty = False
+        self.command_bindings: tuple[CommandBinding, ...] = (
+            self._build_command_bindings()
+        )
+        self.command_map = self._build_command_map(self.command_bindings)
+        self.styles = self._init_styles()
+        with contextlib.suppress(curses.error):
+            self.stdscr.bkgd(" ", self.styles.get("background", 0))
 
     # ---------- UI helpers ----------
     def draw(self) -> None:
         """Draw the complete TUI interface including title, help text, client list, and status."""
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
+        content_width = max(10, w - 1)
 
-        dirty_mark = " *" if self.dirty else ""
-        title = f"Manage Sing-Box  — {self.table_path} | {self.config_path}{dirty_mark}"
-        self.stdscr.addnstr(0, 0, title, w - 1, curses.A_BOLD)
+        self._draw_title(w)
+        list_start_y = self._draw_help_section(start_y=1, width=w)
+        list_start_y = self._draw_table_header(list_start_y, w)
 
-        help1 = "↑↓/PgUp/PgDn move  a add  e rename  d delete  s save  S save+restart  c check  x restart  r reload  q quit"
-        self.stdscr.addnstr(1, 0, help1, w - 1, curses.A_DIM)
-
-        self.stdscr.addnstr(
-            3, 0, f"{'#':>3}  {'UUID':36}  NAME", w - 1, curses.A_UNDERLINE
+        footer_path_rows = self._wrap_segments(
+            [
+                f"clients table: {self.table_path}",
+                f"config: {self.config_path}",
+            ],
+            content_width,
         )
+        reserved_bottom = len(footer_path_rows) + 1
+        list_height = max(1, h - list_start_y - reserved_bottom)
 
-        start = max(0, min(self.cursor - (h - 8), max(0, len(self.clients) - (h - 8))))
-        rows = self.clients[start : start + (h - 8)]
-        for idx, c in enumerate(rows):
-            i = start + idx
-            uid = (c.get("clientId") or "")[:36]
-            name = (c.get("userData") or {}).get("clientName", "")
-            line = f"{i:>3}  {uid:36}  {name}"
-            attr = curses.A_REVERSE if i == self.cursor else 0
-            self.stdscr.addnstr(4 + idx, 0, line, w - 1, attr)
-
-        # footer
-        self.stdscr.addnstr(
-            h - 2, 0, (self.message or "")[: w - 1], w - 1, curses.A_DIM
-        )
+        self._draw_client_rows(list_start_y, list_height, w)
+        self._draw_footer(h - reserved_bottom, footer_path_rows, w)
         self.stdscr.refresh()
 
-    def prompt_line(self, prompt_text: str) -> str | None:
-        """Prompt user for text input on the bottom line.
+    def _draw_title(self, width: int) -> None:
+        dirty_mark = " · MODIFIED" if self.dirty else ""
+        title = f"Manage Sing-Box Users{dirty_mark}"
+        self.stdscr.addnstr(0, 0, title, width - 1, self.styles["title"])
+
+    def _build_help_rows(self) -> list[Sequence[str]]:
+        help_segments = [
+            cmd.display for cmd in self.command_bindings if cmd.show_in_help
+        ]
+        midpoint = (len(help_segments) + 1) // 2
+        return [
+            row for row in (help_segments[:midpoint], help_segments[midpoint:]) if row
+        ]
+
+    def _draw_help_section(self, start_y: int, width: int) -> int:
+        rows = self._build_help_rows()
+        for idx, row in enumerate(rows):
+            self._draw_help_row(start_y + idx, row, width)
+        return start_y + len(rows)
+
+    def _draw_help_row(self, y: int, segments: Sequence[str], width: int) -> None:
+        col = 0
+
+        def write(text: str, attr: int) -> None:
+            nonlocal col
+            if not text or col >= width - 1:
+                return
+            space = width - 1 - col
+            self.stdscr.addnstr(y, col, text, space, attr)
+            col += min(len(text), space)
+
+        for idx, segment in enumerate(segments):
+            if idx:
+                write(" · ", self.styles["help_sep"])
+            key_part, _, desc_part = segment.partition(" ")
+            write(key_part, self.styles["help_key"])
+            if desc_part:
+                write(f" {desc_part}", self.styles["help_dim"])
+
+    def _draw_table_header(self, start_y: int, width: int) -> int:
+        self.stdscr.addnstr(
+            start_y,
+            0,
+            f"{'#':>3}  {'UUID':36}  {'CREATED':24}  NAME",
+            width - 1,
+            self.styles["table_header"],
+        )
+        return start_y + 1
+
+    def _draw_client_rows(self, start_y: int, list_height: int, width: int) -> None:
+        list_height = max(1, list_height)
+        max_start = max(0, len(self.clients) - list_height)
+        self.view_top = min(self.view_top, max_start)
+        if self.cursor < self.view_top:
+            self.view_top = self.cursor
+        elif self.cursor >= self.view_top + list_height:
+            self.view_top = self.cursor - list_height + 1
+        start = self.view_top
+        rows = self.clients[start : start + list_height]
+        for idx, client in enumerate(rows):
+            i = start + idx
+            line = self._format_client_row(i, client)
+            attr = (
+                self.styles["row_selected"] if i == self.cursor else self.styles["row"]
+            )
+            self.stdscr.addnstr(start_y + idx, 0, line, width - 1, attr)
+
+    def _format_client_row(self, index: int, client: ClientEntry) -> str:
+        uid = (client.get("clientId") or "")[:36]
+        user_data = client.get("userData") or {}
+        name = user_data.get("clientName", "")
+        created_raw = user_data.get("creationDate", "")
+        created = created_raw[:24]
+        row_number = index + 1
+        return f"{row_number:>3}  {uid:36}  {created:24}  {name}"
+
+    def _draw_footer(self, status_y: int, path_rows: Sequence[str], width: int) -> None:
+        self.stdscr.addnstr(
+            status_y,
+            0,
+            (self.message or "")[: width - 1],
+            width - 1,
+            self.styles["status"],
+        )
+        for idx, text in enumerate(path_rows):
+            self.stdscr.addnstr(
+                status_y + 1 + idx, 0, text, width - 1, self.styles["path"]
+            )
+
+    def _wrap_segments(
+        self, segments: Sequence[str], width: int, separator: str = " · "
+    ) -> list[str]:
+        rows: list[str] = []
+        current = ""
+        for segment in segments:
+            candidate = segment if not current else f"{current}{separator}{segment}"
+            if len(candidate) > width and current:
+                rows.append(current)
+                current = segment
+            else:
+                current = candidate
+        if current:
+            rows.append(current)
+        return rows
+
+    def _init_styles(self) -> dict[str, int]:
+        """Prepare Catppuccin Mocha-inspired colors and attributes."""
+
+        styles: dict[str, int] = {
+            "title": curses.A_BOLD,
+            "help_dim": curses.A_DIM,
+            "help_key": curses.A_DIM | curses.A_BOLD,
+            "help_sep": curses.A_DIM,
+            "table_header": curses.A_BOLD | curses.A_UNDERLINE,
+            "row": 0,
+            "row_selected": curses.A_REVERSE | curses.A_BOLD,
+            "input_field": curses.A_REVERSE,
+            "input_cursor": curses.A_REVERSE | curses.A_BOLD,
+            "status": curses.A_DIM | curses.A_BOLD,
+            "path": curses.A_DIM,
+            "background": 0,
+            "modal_window": 0,
+        }
+
+        if not curses.has_colors():
+            return styles
+
+        curses.start_color()
+        curses.use_default_colors()
+
+        def hex_to_curses_rgb(code: str) -> tuple[int, int, int]:
+            code = code.lstrip("#")
+            r = int(code[0:2], 16)
+            g = int(code[2:4], 16)
+            b = int(code[4:6], 16)
+            r_scaled = round(r / 255 * 1000)
+            g_scaled = round(g / 255 * 1000)
+            b_scaled = round(b / 255 * 1000)
+            return r_scaled, g_scaled, b_scaled
+
+        def register_catppuccin_colors() -> dict[str, int]:
+            if not curses.can_change_color():
+                return {}
+            base_index = 16
+            required_slots = base_index + len(CATPPUCCIN_MOCHA)
+            if required_slots > curses.COLORS:
+                return {}
+            assigned: dict[str, int] = {}
+            for offset, (name, code) in enumerate(CATPPUCCIN_MOCHA.items()):
+                color_id = base_index + offset
+                r, g, b = hex_to_curses_rgb(code)
+                try:
+                    curses.init_color(color_id, r, g, b)
+                except curses.error:
+                    assigned.clear()
+                    break
+                assigned[name] = color_id
+            return assigned
+
+        custom_colors = register_catppuccin_colors()
+
+        def color(name: str, fallback: int) -> int:
+            return custom_colors.get(name, fallback)
+
+        def make_pair(idx: int, fg: int, bg: int = -1) -> int:
+            with contextlib.suppress(curses.error):
+                curses.init_pair(idx, fg, bg)
+            return curses.color_pair(idx)
+
+        base_color = color("base", curses.COLOR_BLACK)
+        rosewater = make_pair(1, color("rosewater", curses.COLOR_MAGENTA), base_color)
+        lavender = make_pair(2, color("lavender", curses.COLOR_CYAN), base_color)
+        peach = make_pair(3, color("peach", curses.COLOR_YELLOW), base_color)
+        text = make_pair(4, color("text", curses.COLOR_WHITE), base_color)
+        focus = make_pair(
+            5, color("text", curses.COLOR_WHITE), color("surface1", curses.COLOR_BLUE)
+        )
+        panel = make_pair(
+            6, color("text", curses.COLOR_WHITE), color("panel_bg", curses.COLOR_BLUE)
+        )
+        cursor_accent = make_pair(
+            7,
+            color("cursor_fg", curses.COLOR_BLACK),
+            color("cursor_bg", curses.COLOR_MAGENTA),
+        )
+        background_attr = make_pair(8, -1, base_color)
+        input_field_attr = make_pair(
+            9,
+            color("text", curses.COLOR_WHITE),
+            color("input_bg", curses.COLOR_BLUE),
+        )
+
+        styles.update(
+            {
+                "title": rosewater | curses.A_BOLD,
+                "help_dim": lavender | curses.A_DIM,
+                "help_key": peach | curses.A_BOLD,
+                "help_sep": lavender | curses.A_DIM,
+                "table_header": rosewater | curses.A_BOLD,
+                "row": text,
+                "row_selected": focus | curses.A_BOLD,
+                "input_field": input_field_attr,
+                "input_cursor": cursor_accent | curses.A_BOLD,
+                "status": peach | curses.A_BOLD,
+                "path": lavender | curses.A_DIM,
+                "background": background_attr,
+                "modal_window": panel,
+            }
+        )
+        styles["path"] = styles["help_dim"]
+        return styles
+
+    def _apply_modal_background(self, window: curses.window) -> None:
+        attr = self.styles.get("modal_window")
+        if not attr:
+            return
+        with contextlib.suppress(curses.error):
+            window.bkgd(" ", attr)
+
+    def _prepare_modal_interaction(self) -> None:
+        self.stdscr.nodelay(False)
+        curses.noecho()
+        with contextlib.suppress(curses.error):
+            curses.curs_set(0)
+
+    def _spawn_modal_window(
+        self,
+        desired_width: int,
+        desired_height: int,
+        *,
+        min_width: int = 10,
+        min_height: int = 5,
+    ) -> tuple[curses.window, int, int]:
+        h, w = self.stdscr.getmaxyx()
+        max_width = max(min_width, w - 2)
+        max_height = max(min_height, h - 2)
+        width = min(max(desired_width, min_width), max_width)
+        height = min(max(desired_height, min_height), max_height)
+        top = max(0, (h - height) // 2)
+        left = max(0, (w - width) // 2)
+        win = curses.newwin(height, width, top, left)
+        win.keypad(True)
+        self._apply_modal_background(win)
+        return win, height, width
+
+    @contextlib.contextmanager
+    def _modal_window(
+        self,
+        desired_width: int,
+        desired_height: int,
+        *,
+        min_width: int = 10,
+        min_height: int = 5,
+    ) -> Iterator[tuple[curses.window, int, int]]:
+        """Context manager that prepares, creates, and tears down a modal window."""
+        self._prepare_modal_interaction()
+        win, height, width = self._spawn_modal_window(
+            desired_width,
+            desired_height,
+            min_width=min_width,
+            min_height=min_height,
+        )
+        try:
+            yield win, height, width
+        finally:
+            win.erase()
+            win.refresh()
+            del win
+            with contextlib.suppress(curses.error):
+                curses.curs_set(0)
+            self.stdscr.touchwin()
+            self.stdscr.refresh()
+
+    def _modal_loop(
+        self,
+        window: curses.window,
+        redraw: Callable[[], None],
+        handler: Callable[[int], bool],
+    ) -> None:
+        """Run a modal interaction loop until handler requests exit."""
+
+        while True:
+            redraw()
+            try:
+                ch = window.getch()
+            except KeyboardInterrupt:
+                ch = 3  # treat as Ctrl-C
+            if handler(ch):
+                break
+
+    def _render_modal_spec(
+        self,
+        window: curses.window,
+        width: int,
+        height: int,
+        spec: ModalSpec,
+    ) -> None:
+        window.erase()
+        window.border()
+        window.addnstr(1, 2, spec.header[: width - 4], width - 4)
+        for idx, line in enumerate(spec.body_lines):
+            y = 2 + idx
+            if y >= height - 2:
+                break
+            window.addnstr(y, 2, line[: width - 4], width - 4)
+        if spec.footer:
+            window.addnstr(
+                height - 2, 2, spec.footer[: width - 4], width - 4, curses.A_DIM
+            )
+        window.refresh()
+
+    def _draw_button_row(
+        self,
+        window: curses.window,
+        y: int,
+        width: int,
+        tokens: Sequence[str],
+        selected: int,
+    ) -> None:
+        x = 2
+        for idx, token in enumerate(tokens):
+            attr = curses.A_REVERSE if idx == selected else curses.A_BOLD
+            space = max(0, width - 4 - x)
+            if space <= 0:
+                break
+            window.addnstr(y, x, token, space, attr)
+            x += len(token) + 1
+            if x >= width - 2:
+                break
+
+    def _build_command_bindings(self) -> tuple[CommandBinding, ...]:
+        """Create the registry describing shortcuts, help text, and handlers."""
+
+        def run(action: Callable[[], None]) -> Callable[[], bool]:
+            def runner() -> bool:
+                action()
+                return False
+
+            return runner
+
+        def move(delta: int, wrap: bool = False) -> Callable[[], bool]:
+            def runner() -> bool:
+                self.move_cursor(delta, wrap=wrap)
+                return False
+
+            return runner
+
+        def save_and_restart() -> bool:
+            self.apply_and_save()
+            self.do_restart()
+            return False
+
+        def request_quit() -> bool:
+            return self.confirm_quit()
+
+        return (
+            CommandBinding("↑/k move up", (curses.KEY_UP, ord("k")), move(-1, True)),
+            CommandBinding("↓/j move down", (curses.KEY_DOWN, ord("j")), move(1, True)),
+            CommandBinding("PgUp prev page", (curses.KEY_PPAGE,), move(-10)),
+            CommandBinding("PgDn next page", (curses.KEY_NPAGE,), move(10)),
+            CommandBinding("a add", (ord("a"), ord("A")), run(self.add_client)),
+            CommandBinding("e rename", (ord("e"), ord("E")), run(self.rename_client)),
+            CommandBinding("d delete", (ord("d"), ord("D")), run(self.delete_client)),
+            CommandBinding("s save", (ord("s"),), run(self.apply_and_save)),
+            CommandBinding("S save and restart", (ord("S"),), save_and_restart),
+            CommandBinding("c check", (ord("c"), ord("C")), run(self.do_check)),
+            CommandBinding("x restart", (ord("x"), ord("X")), run(self.do_restart)),
+            CommandBinding("r reload", (ord("r"), ord("R")), run(self.reload_all)),
+            CommandBinding("q quit", (ord("q"), ord("Q"), 3), request_quit),
+        )
+
+    def _build_command_map(
+        self, bindings: Sequence[CommandBinding]
+    ) -> dict[int, Callable[[], bool]]:
+        """Create a direct lookup table for key codes to handlers."""
+
+        table: dict[int, Callable[[], bool]] = {}
+        for binding in bindings:
+            for key in binding.keys:
+                if key in table:
+                    raise ValueError(
+                        f"Duplicate command key detected: {key} for '{binding.display}'"
+                    )
+                table[key] = binding.handler
+        return table
+
+    def dispatch_command(self, key: int) -> bool:
+        """Dispatch a keypress via the registry. Returns True if the app should exit."""
+
+        if key == -1:
+            return False
+        handler = self.command_map.get(key)
+        return handler() if handler else False
+
+    def prompt_line(
+        self, prompt_text: str, initial_text: str | None = None
+    ) -> str | None:
+        """Prompt user for text input inside a centered modal window.
 
         Args:
-            prompt_text (str): Text to display as the prompt.
-
-        Returns:
-            Optional[str]: User input string, or None if cancelled.
+            prompt_text: Message displayed at the top of the modal.
+            initial_text: Optional text to pre-fill into the input buffer.
         """
-        curses.echo()
-        self.stdscr.nodelay(False)
-        h, w = self.stdscr.getmaxyx()
-        self.stdscr.move(h - 1, 0)
-        self.stdscr.clrtoeol()
-        self.stdscr.addnstr(h - 1, 0, f"{prompt_text}: ", w - 1)
-        self.stdscr.refresh()
-        try:
-            s: bytes = self.stdscr.getstr(h - 1, len(prompt_text) + 2, 512)
-        except curses.error:
-            curses.noecho()
-            return None
-        curses.noecho()
-        if not s:
-            return None
-        return s.decode("utf-8")
+        max_chars = 512
+        seed = (initial_text or "")[:max_chars]
+        value: list[str] = list(seed)
+        desired_width = max(len(prompt_text) + 10, 30)
+        result: str | None = None
+
+        with self._modal_window(
+            desired_width,
+            7,
+            min_width=30,
+            min_height=7,
+        ) as (win, height, width):
+            cursor = len(value)
+            scroll = 0
+
+            def build_instructions(max_width: int) -> str:
+                segments = [
+                    "Esc cancel",
+                    "Enter accept",
+                    "←→ move",
+                    "Ctrl-A/E/U/K",
+                ]
+                while segments:
+                    text = " · ".join(segments)
+                    if len(text) <= max_width:
+                        return text
+                    segments.pop()
+                return "Esc cancel"
+
+            instructions = build_instructions(width - 4)
+
+            def redraw_modal(window: curses.window, buffer: list[str]) -> None:
+                nonlocal scroll
+                window.erase()
+                window.border()
+                window.addnstr(1, 2, prompt_text[: width - 4], width - 4)
+                text = "".join(buffer)
+                input_width = width - 4
+                if cursor < scroll:
+                    scroll = cursor
+                elif cursor > scroll + input_width:
+                    scroll = cursor - input_width
+                scroll = max(0, min(scroll, max(0, len(text) - input_width)))
+                slice_text = text[scroll : scroll + input_width]
+                padded = slice_text.ljust(input_width)
+                input_attr = self.styles.get("input_field", curses.A_REVERSE)
+                window.addnstr(3, 2, padded, input_width, input_attr)
+                window.addnstr(4, 2, " " * input_width, input_width)
+                info = instructions[: width - 4]
+                window.addnstr(height - 2, 2, " " * (width - 4), width - 4)
+                window.addnstr(height - 2, 2, info, width - 4, curses.A_DIM)
+                cursor_rel = max(0, min(cursor - scroll, input_width - 1))
+                cursor_char = padded[cursor_rel] if cursor_rel < len(padded) else " "
+                cursor_attr = self.styles.get(
+                    "input_cursor", input_attr | curses.A_BOLD
+                )
+                window.addch(3, 2 + cursor_rel, cursor_char or " ", cursor_attr)
+                window.refresh()
+
+            def redraw() -> None:
+                redraw_modal(win, value)
+
+            def handle(ch: int) -> bool:
+                nonlocal cursor, result
+                if ch in (curses.KEY_ENTER, 10, 13):
+                    result = None if not value else "".join(value)
+                    return True
+                if ch in (27, 3):
+                    result = None
+                    return True
+                if ch in (curses.KEY_LEFT, ord("h")):
+                    cursor = max(0, cursor - 1)
+                    return False
+                if ch in (curses.KEY_RIGHT, ord("l")):
+                    cursor = min(len(value), cursor + 1)
+                    return False
+                if ch in (curses.KEY_HOME, CTRL_A):
+                    cursor = 0
+                    return False
+                if ch in (curses.KEY_END, CTRL_E):
+                    cursor = len(value)
+                    return False
+                if ch == CTRL_U:
+                    if cursor > 0:
+                        del value[:cursor]
+                        cursor = 0
+                    return False
+                if ch == CTRL_K:
+                    if cursor < len(value):
+                        del value[cursor:]
+                    return False
+                if ch in (curses.KEY_BACKSPACE, 127, 8):
+                    if cursor > 0:
+                        cursor -= 1
+                        value.pop(cursor)
+                    return False
+                if ch == curses.KEY_DC:
+                    if cursor < len(value):
+                        value.pop(cursor)
+                    return False
+                if 0 <= ch < KEY_BYTE_MAX and len(value) < max_chars:
+                    value.insert(cursor, chr(ch))
+                    cursor += 1
+                return False
+
+            self._modal_loop(win, redraw, handle)
+
+        return result
 
     def prompt_choice(self, prompt_text: str, choices: str) -> str | None:
-        """Prompt user to select one character from available choices.
+        """Prompt for a single-character choice inside a modal window."""
+        text = f"{prompt_text}"
+        hint = f"[{'/'.join(choices)}]"
+        spec = ModalSpec(header=text, body_lines=[hint], footer="Esc cancel")
+        inner_width = max(len(text) + len(hint) + 6, 30)
+        result: str | None = None
 
-        Args:
-            prompt_text (str): Text to display as the prompt.
-            choices (str): String of valid choice characters.
+        with self._modal_window(
+            inner_width,
+            5,
+            min_width=30,
+            min_height=5,
+        ) as (win, height, width):
 
-        Returns:
-            Optional[str]: Selected character, or None if cancelled (Ctrl-C/Esc).
-        """
-        self.stdscr.nodelay(False)
-        h, w = self.stdscr.getmaxyx()
-        self.stdscr.move(h - 1, 0)
-        self.stdscr.clrtoeol()
-        self.stdscr.addnstr(h - 1, 0, f"{prompt_text} [{'/'.join(choices)}]: ", w - 1)
-        self.stdscr.refresh()
-        while True:
-            ch: int = self.stdscr.getch()
-            if ch == -1:
-                continue
-            if ch in (3, 27):  # Ctrl-C / Esc => cancel
-                return None
-            if 0 <= ch < KEY_BYTE_MAX:
-                c = chr(ch).lower()
-                if c in choices:
-                    return c
+            def redraw_choice() -> None:
+                self._render_modal_spec(win, width, height, spec)
+
+            def redraw() -> None:
+                redraw_choice()
+
+            def handle(ch: int) -> bool:
+                nonlocal result
+                if ch in (3, 27):
+                    result = None
+                    return True
+                if 0 <= ch < KEY_BYTE_MAX:
+                    c = chr(ch).lower()
+                    if c in choices:
+                        result = c
+                        return True
+                return False
+
+            self._modal_loop(win, redraw, handle)
+        return result
+
+    def prompt_buttons(
+        self, prompt_text: str, buttons: Sequence[tuple[str, str]]
+    ) -> str | None:
+        """Prompt inside a modal window that renders selectable buttons."""
+        if not buttons:
+            return None
+
+        button_tokens = [f"[ {label} ]" for label, _ in buttons]
+        buttons_line = " ".join(button_tokens)
+        instructions = "←/→ select · Enter confirm · Esc cancel"
+        inner_width = max(
+            len(prompt_text) + 4, len(buttons_line) + 4, len(instructions) + 4, 36
+        )
+        result: str | None = None
+        selected = 0
+
+        with self._modal_window(
+            inner_width,
+            6,
+            min_width=36,
+            min_height=6,
+        ) as (win, height, width):
+
+            def redraw_buttons() -> None:
+                self._render_modal_spec(
+                    win,
+                    width,
+                    height,
+                    ModalSpec(
+                        header=prompt_text,
+                        body_lines=[""],
+                        footer=instructions,
+                    ),
+                )
+                self._draw_button_row(win, 3, width, button_tokens, selected)
+
+            def redraw() -> None:
+                redraw_buttons()
+
+            def handle(ch: int) -> bool:
+                nonlocal selected, result
+                if ch in (27, 3):
+                    result = None
+                    return True
+                if ch in (curses.KEY_LEFT, ord("h")):
+                    selected = (selected - 1) % len(buttons)
+                    return False
+                if ch in (curses.KEY_RIGHT, ord("l")):
+                    selected = (selected + 1) % len(buttons)
+                    return False
+                if ch in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                    result = buttons[selected][1]
+                    return True
+                return False
+
+            self._modal_loop(win, redraw, handle)
+
+        return result
 
     # ---------- actions ----------
     def add_client(self) -> None:
@@ -461,7 +1056,7 @@ class App:
             return
         cur = self.clients[self.cursor]
         old = (cur.get("userData") or {}).get("clientName", "")
-        name = self.prompt_line(f"Rename [{old}]")
+        name = self.prompt_line("Rename client", old)
         if not name:
             self.message = "Rename cancelled."
             return
@@ -477,22 +1072,30 @@ class App:
         cur = self.clients[self.cursor]
         uid = cur.get("clientId", "")
         name = (cur.get("userData") or {}).get("clientName", "")
-        ans = self.prompt_choice(f"Delete {name} ({uid})?", "ync")
+        ans = self.prompt_buttons(
+            f"Delete {name} ({uid})?",
+            [
+                ("Delete", "y"),
+                ("Cancel", "c"),
+            ],
+        )
         if ans == "y":
             self.clients.pop(self.cursor)
             self.cursor = max(0, self.cursor - 1)
             self.dirty = True
             self.message = f"Deleted {name}."
-        elif ans == "n":
-            self.message = "Not deleted."
         else:
             self.message = "Cancelled."
 
     def reload_all(self) -> None:
         """Reload configuration and clients from disk, discarding unsaved changes."""
+        if self.dirty and not self._confirm_discard_or_save():
+            self.message = "Reload cancelled."
+            return
         self.config = read_json(self.config_file, default_config())
         self.clients = read_json(self.table_file, default_clients())
         self.cursor = 0
+        self.view_top = 0
         self.dirty = False
         self.message = "Reloaded."
 
@@ -543,6 +1146,17 @@ class App:
         tail = (out or "").strip()
         self.message = f"restart={'OK' if ok else 'FAIL'} {tail}"
 
+    def move_cursor(self, delta: int, wrap: bool = False) -> None:
+        """Move selection cursor by delta, optionally wrapping around list bounds."""
+        total = len(self.clients)
+        if total == 0:
+            self.cursor = 0
+            return
+        if wrap:
+            self.cursor = (self.cursor + delta) % total
+        else:
+            self.cursor = min(max(0, self.cursor + delta), total - 1)
+
     def confirm_quit(self) -> bool:
         """Prompt to save changes before quitting if there are unsaved changes.
 
@@ -551,7 +1165,28 @@ class App:
         """
         if not self.dirty:
             return True
-        ans = self.prompt_choice("Unsaved changes. Save before quit?", "ync")
+        ans = self.prompt_buttons(
+            "Unsaved changes detected. How should we proceed?",
+            [
+                ("Save & Quit", "y"),
+                ("Discard", "n"),
+                ("Cancel", "c"),
+            ],
+        )
+        if ans == "y":
+            self.apply_and_save()
+            return True
+        return ans == "n"
+
+    def _confirm_discard_or_save(self) -> bool:
+        ans = self.prompt_buttons(
+            "Unsaved changes detected. Save before proceeding?",
+            [
+                ("Save", "y"),
+                ("Discard", "n"),
+                ("Cancel", "c"),
+            ],
+        )
         if ans == "y":
             self.apply_and_save()
             return True
@@ -561,39 +1196,15 @@ class App:
     def run(self) -> None:
         """Run main event loop handling keyboard input and updating the UI."""
         curses.curs_set(0)
-        self.stdscr.nodelay(False)  # blocking getch to avoid flicker
+        self.stdscr.nodelay(False)
         while True:
             self.draw()
-            ch = self.stdscr.getch()
-            if ch in (ord("q"), ord("Q"), 3):  # q or Ctrl-C
-                if self.confirm_quit():
-                    break
-                continue
-            if ch in (curses.KEY_UP, ord("k")):
-                self.cursor = max(0, self.cursor - 1)
-            elif ch in (curses.KEY_DOWN, ord("j")):
-                self.cursor = min(max(0, len(self.clients) - 1), self.cursor + 1)
-            elif ch == curses.KEY_PPAGE:
-                self.cursor = max(0, self.cursor - 10)
-            elif ch == curses.KEY_NPAGE:
-                self.cursor = min(max(0, len(self.clients) - 1), self.cursor + 10)
-            elif ch in (ord("a"), ord("A")):
-                self.add_client()
-            elif ch in (ord("e"), ord("E")):
-                self.rename_client()
-            elif ch in (ord("d"), ord("D")):
-                self.delete_client()
-            elif ch in (ord("r"), ord("R")):
-                self.reload_all()
-            elif ch == ord("s"):
-                self.apply_and_save()
-            elif ch == ord("S"):
-                self.apply_and_save()
-                self.do_restart()
-            elif ch in (ord("c"), ord("C")):
-                self.do_check()
-            elif ch in (ord("x"), ord("X")):
-                self.do_restart()
+            try:
+                ch = self.stdscr.getch()
+            except KeyboardInterrupt:
+                ch = 3  # emulate Ctrl-C keypress
+            if self.dispatch_command(ch):
+                break
 
 
 def main() -> None:
@@ -605,29 +1216,34 @@ def main() -> None:
         "--config",
         type=Path,
         default=Path(DEFAULT_CONFIG),
-        help="Path to sing-box config.json",
+        metavar="PATH",
+        help=f"Path to sing-box config.json (default: {DEFAULT_CONFIG})",
     )
     ap.add_argument(
-        "--table",
+        "--clients-table",
         type=Path,
         default=Path(DEFAULT_TABLE),
-        help="Path to clientsTable.json",
+        metavar="PATH",
+        dest="clients_table",
+        help=f"Path to clientsTable.json (default: {DEFAULT_TABLE})",
     )
     ap.add_argument(
         "--vless-tag",
         default=DEFAULT_TAG,
-        help="VLESS inbound tag to update (fallback: first VLESS)",
+        metavar="TAG",
+        help=f"VLESS inbound tag to update (default: {DEFAULT_TAG}; fallback: first VLESS)",
     )
     ap.add_argument(
         "--container",
         default=DEFAULT_CONTAINER,
-        help="Docker container name to restart (for S/x)",
+        metavar="NAME",
+        help=f"Docker container name to restart (default: {DEFAULT_CONTAINER})",
     )
     args = ap.parse_args()
 
     curses.wrapper(
         lambda stdscr: App(
-            stdscr, args.config, args.table, args.vless_tag, args.container
+            stdscr, args.config, args.clients_table, args.vless_tag, args.container
         ).run()
     )
 
