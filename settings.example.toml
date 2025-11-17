@@ -1,9 +1,13 @@
 # Copy this file to singbox-manage.toml and adjust values as needed.
 # Supported keys:
-#   container    - Docker container name to restart after saving.
-#   docker_image - Image used for config checks (docker run ... check).
-#   vless_tag    - Tag of the VLESS inbound to manage.
+#   config_path    - Path to sing-box config.json.
+#   clients_table  - Path to clientsTable.json.
+#   container      - Docker container name to restart after saving.
+#   docker_image   - Image used for config checks (docker run ... check).
+#   vless_tag      - Tag of the VLESS inbound to manage.
 
+config_path = "/opt/singbox/config.json"
+clients_table = "/opt/singbox/clientsTable.json"
 container = "singbox"
 docker_image = "ghcr.io/sagernet/sing-box:latest"
 vless_tag = "vless-in"

@@ -19,7 +19,7 @@ import argparse
 from collections.abc import Callable, Iterator, Sequence
 import contextlib
 import curses
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields, replace
 from datetime import datetime
 import json
 from pathlib import Path
@@ -30,8 +30,8 @@ import tomllib
 from typing import TypedDict, cast
 import uuid
 
-DEFAULT_CONFIG = "/opt/singbox/config.json"
-DEFAULT_TABLE = "/opt/singbox/clientsTable.json"
+DEFAULT_CONFIG = Path("/opt/singbox/config.json")
+DEFAULT_TABLE = Path("/opt/singbox/clientsTable.json")
 DEFAULT_TAG = "vless-in"
 DEFAULT_FLOW = "xtls-rprx-vision"
 DEFAULT_CONTAINER = "singbox"
@@ -88,6 +88,8 @@ class Settings:
     vless_tag: str = DEFAULT_TAG
     container: str = DEFAULT_CONTAINER
     docker_image: str = DEFAULT_DOCKER_IMAGE
+    config_path: Path = DEFAULT_CONFIG
+    clients_table: Path = DEFAULT_TABLE
 
 
 class ClientUserData(TypedDict, total=False):
@@ -145,7 +147,6 @@ def load_settings(path: Path) -> Settings:
     """Load runtime settings from TOML, falling back to defaults when missing."""
 
     base = Settings()
-    values = asdict(base)
     if not path.exists():
         return base
     try:
@@ -155,7 +156,9 @@ def load_settings(path: Path) -> Settings:
         raise SystemExit(f"ERROR: cannot parse settings at {path}: {e}") from e
     if not isinstance(data, dict):
         raise SystemExit(f"ERROR: settings file {path} must contain a TOML table.")
-    for key in values:
+    overrides: dict[str, str | Path] = {}
+    for field in fields(Settings):
+        key = field.name
         raw = data.get(key)
         if raw is None:
             continue
@@ -165,8 +168,8 @@ def load_settings(path: Path) -> Settings:
             )
         stripped = raw.strip()
         if stripped:
-            values[key] = stripped
-    return Settings(**values)
+            overrides[key] = Path(stripped) if field.type is Path else stripped
+    return replace(base, **overrides)  # type: ignore[arg-type]
 
 
 def now_ctime() -> str:
@@ -376,42 +379,25 @@ def docker_restart(container: str) -> tuple[bool, str]:
 
 
 class App:
-    """Main TUI application for managing sing-box users.
-
-    Attributes:
-        stdscr (curses.window): Curses standard screen object.
-        config_path (Path): Path to sing-box config.json.
-        table_path (Path): Path to clientsTable.json.
-        settings (Settings): Runtime configuration loaded from TOML.
-        flow (str): VLESS flow string written into config users.
-        config (SingBoxConfig): Loaded sing-box configuration.
-        clients (list[ClientEntry]): List of client entries.
-        cursor (int): Current cursor position in the UI.
-        message (str): Status message to display.
-        dirty (bool): Whether there are unsaved changes.
-    """
+    """Main TUI application for managing sing-box users."""
 
     def __init__(
         self,
         stdscr: curses.window,
-        config_path: Path,
-        table_path: Path,
         settings: Settings,
     ) -> None:
         """Initialize the application with configuration paths and load data.
 
         Args:
             stdscr: Curses standard screen object.
-            config_path (Path): Path to sing-box config.json.
-            table_path (Path): Path to clientsTable.json.
-            settings (Settings): Runtime configuration loaded from TOML file.
+            settings (Settings): Runtime configuration loaded from TOML and CLI overrides.
         """
         self.stdscr = stdscr
-        self.config_path = config_path
-        self.table_path = table_path
-        self.config_file = Path(config_path)
-        self.table_file = Path(table_path)
         self.settings = settings
+        self.config_path = Path(self.settings.config_path)
+        self.table_path = Path(self.settings.clients_table)
+        self.config_file = self.config_path
+        self.table_file = self.table_path
         self.flow = DEFAULT_FLOW
 
         self.config: SingBoxConfig = read_json(self.config_file, default_config())
@@ -1254,14 +1240,14 @@ def main() -> None:
     ap.add_argument(
         "--config",
         type=Path,
-        default=Path(DEFAULT_CONFIG),
+        default=None,
         metavar="PATH",
         help=f"Path to sing-box config.json (default: {DEFAULT_CONFIG})",
     )
     ap.add_argument(
         "--clients-table",
         type=Path,
-        default=Path(DEFAULT_TABLE),
+        default=None,
         metavar="PATH",
         dest="clients_table",
         help=f"Path to clientsTable.json (default: {DEFAULT_TABLE})",
@@ -1269,12 +1255,14 @@ def main() -> None:
     args = ap.parse_args()
 
     settings = load_settings(DEFAULT_SETTINGS_PATH)
+    if args.config is not None:
+        settings = replace(settings, config_path=args.config)
+    if args.clients_table is not None:
+        settings = replace(settings, clients_table=args.clients_table)
 
     curses.wrapper(
         lambda stdscr: App(
             stdscr,
-            args.config,
-            args.clients_table,
             settings,
         ).run()
     )
