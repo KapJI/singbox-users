@@ -1260,12 +1260,7 @@ def main() -> None:
     if args.clients_table is not None:
         settings = replace(settings, clients_table=args.clients_table)
 
-    curses.wrapper(
-        lambda stdscr: App(
-            stdscr,
-            settings,
-        ).run()
-    )
+    curses.wrapper(lambda stdscr: App(stdscr, settings).run())
 
 
 if __name__ == "__main__":
