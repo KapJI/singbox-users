@@ -8,11 +8,35 @@ checks and restarts behave the same way they do in production.
 
 ```bash
 chmod +x singbox-manage.py
-./singbox-manage.py [--config PATH] [--clients-table PATH] [--vless-tag TAG] [--container NAME]
+./singbox-manage.py [--config PATH] [--clients-table PATH]
 ```
 
-Defaults: `/opt/singbox/{config.json,clientsTable.json}`, VLESS tag `vless-in`, container name
-`singbox`.
+Run from any working directory; the script always looks for `singbox-manage.toml` next to
+`singbox-manage.py`. CLI flags override whatever is in that file, so you can point at ad-hoc JSON
+paths without editing the config.
+
+### Settings file
+
+Copy `settings.example.toml` to `singbox-manage.toml` and tweak the values:
+
+```toml
+config_path = "/opt/singbox/config.json"
+clients_table = "/opt/singbox/clientsTable.json"
+vless_tag = "vless-in"
+container = "singbox"
+docker_image = "ghcr.io/sagernet/sing-box:latest"
+```
+
+Leave any key out to inherit the defaults shown above. Flags `--config` / `--clients-table` take
+priority over the TOML settings at runtime.
+
+Key meanings:
+
+- `config_path`: Location of sing-box `config.json`.
+- `clients_table`: Location of `clientsTable.json`.
+- `vless_tag`: Which inbound's users array is synced.
+- `container`: Container restarted by `S`/`x`.
+- `docker_image`: Image pulled for the `docker run ... check` command.
 
 ## Why use it?
 

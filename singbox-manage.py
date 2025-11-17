@@ -19,21 +19,26 @@ import argparse
 from collections.abc import Callable, Iterator, Sequence
 import contextlib
 import curses
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from datetime import datetime
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import time
+import tomllib
 from typing import TypedDict, cast
 import uuid
 
-DEFAULT_CONFIG = "/opt/singbox/config.json"
-DEFAULT_TABLE = "/opt/singbox/clientsTable.json"
+DEFAULT_CONFIG = Path("/opt/singbox/config.json")
+DEFAULT_TABLE = Path("/opt/singbox/clientsTable.json")
 DEFAULT_TAG = "vless-in"
 DEFAULT_FLOW = "xtls-rprx-vision"
 DEFAULT_CONTAINER = "singbox"
+DEFAULT_SETTINGS = "singbox-manage.toml"
+DEFAULT_DOCKER_IMAGE = "ghcr.io/sagernet/sing-box:latest"
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_SETTINGS_PATH = SCRIPT_DIR / DEFAULT_SETTINGS
 KEY_BYTE_MAX = 256  # upper bound for single-byte key values
 CTRL_A = 1
 CTRL_E = 5
@@ -74,6 +79,17 @@ class ModalSpec:
     header: str
     body_lines: Sequence[str]
     footer: str | None = None
+
+
+@dataclass(frozen=True)
+class Settings:
+    """Runtime settings loaded from singbox-manage.toml."""
+
+    vless_tag: str = DEFAULT_TAG
+    container: str = DEFAULT_CONTAINER
+    docker_image: str = DEFAULT_DOCKER_IMAGE
+    config_path: Path = DEFAULT_CONFIG
+    clients_table: Path = DEFAULT_TABLE
 
 
 class ClientUserData(TypedDict, total=False):
@@ -125,6 +141,35 @@ def default_clients() -> list[ClientEntry]:
     """Return an empty clients table list."""
 
     return []
+
+
+def load_settings(path: Path) -> Settings:
+    """Load runtime settings from TOML, falling back to defaults when missing."""
+
+    base = Settings()
+    if not path.exists():
+        return base
+    try:
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise SystemExit(f"ERROR: cannot parse settings at {path}: {e}") from e
+    if not isinstance(data, dict):
+        raise SystemExit(f"ERROR: settings file {path} must contain a TOML table.")
+    overrides: dict[str, str | Path] = {}
+    for field in fields(Settings):
+        key = field.name
+        raw = data.get(key)
+        if raw is None:
+            continue
+        if not isinstance(raw, str):
+            raise SystemExit(
+                f"ERROR: value for '{key}' in {path} must be a string, got {type(raw)!r}."
+            )
+        stripped = raw.strip()
+        if stripped:
+            overrides[key] = Path(stripped) if field.type is Path else stripped
+    return replace(base, **overrides)  # type: ignore[arg-type]
 
 
 def now_ctime() -> str:
@@ -270,11 +315,12 @@ def clients_from_config_users(
     return out
 
 
-def docker_check_config(config_path: Path) -> tuple[bool, str]:
+def docker_check_config(config_path: Path, image: str) -> tuple[bool, str]:
     """Validate sing-box config using Docker container.
 
     Args:
         config_path (Path): Path to the config.json file to validate.
+        image (str): Docker image used for running the sing-box check.
 
     Returns:
         tuple[bool, str]: (success status, output message).
@@ -285,7 +331,7 @@ def docker_check_config(config_path: Path) -> tuple[bool, str]:
         "--rm",
         "-v",
         f"{config_path}:/etc/sing-box/config.json:ro",
-        "ghcr.io/sagernet/sing-box:latest",
+        image,
         "check",
         "-c",
         "/etc/sing-box/config.json",
@@ -333,53 +379,32 @@ def docker_restart(container: str) -> tuple[bool, str]:
 
 
 class App:
-    """Main TUI application for managing sing-box users.
-
-    Attributes:
-        stdscr (curses.window): Curses standard screen object.
-        config_path (Path): Path to sing-box config.json.
-        table_path (Path): Path to clientsTable.json.
-        vless_tag (str): VLESS inbound tag to manage.
-        flow (str): Flow control setting for VLESS.
-        container (str): Docker container name.
-        config (SingBoxConfig): Loaded sing-box configuration.
-        clients (list[ClientEntry]): List of client entries.
-        cursor (int): Current cursor position in the UI.
-        message (str): Status message to display.
-        dirty (bool): Whether there are unsaved changes.
-    """
+    """Main TUI application for managing sing-box users."""
 
     def __init__(
         self,
         stdscr: curses.window,
-        config_path: Path,
-        table_path: Path,
-        vless_tag: str,
-        container: str,
+        settings: Settings,
     ) -> None:
         """Initialize the application with configuration paths and load data.
 
         Args:
             stdscr: Curses standard screen object.
-            config_path (Path): Path to sing-box config.json.
-            table_path (Path): Path to clientsTable.json.
-            vless_tag (str): VLESS inbound tag to manage.
-            container (str): Docker container name for restart operations.
+            settings (Settings): Runtime configuration loaded from TOML and CLI overrides.
         """
         self.stdscr = stdscr
-        self.config_path = config_path
-        self.table_path = table_path
-        self.config_file = Path(config_path)
-        self.table_file = Path(table_path)
-        self.vless_tag = vless_tag
+        self.settings = settings
+        self.config_path = Path(self.settings.config_path)
+        self.table_path = Path(self.settings.clients_table)
+        self.config_file = self.config_path
+        self.table_file = self.table_path
         self.flow = DEFAULT_FLOW
-        self.container = container
 
         self.config: SingBoxConfig = read_json(self.config_file, default_config())
         self.clients: list[ClientEntry] = read_json(self.table_file, default_clients())
         if not self.clients:
             try:
-                idx = find_vless_inbound(self.config, self.vless_tag)
+                idx = find_vless_inbound(self.config, self.settings.vless_tag)
                 inbounds = self.config.get("inbounds", [])
                 users = inbounds[idx].get("users", []) if inbounds else []
                 if users:
@@ -1105,7 +1130,7 @@ class App:
         Creates backups of both files before saving.
         """
         try:
-            idx = find_vless_inbound(self.config, self.vless_tag)
+            idx = find_vless_inbound(self.config, self.settings.vless_tag)
         except SystemExit as e:
             self.message = str(e)
             return
@@ -1136,13 +1161,13 @@ class App:
 
     def do_check(self) -> None:
         """Validate the sing-box configuration using Docker."""
-        ok, out = docker_check_config(self.config_path)
+        ok, out = docker_check_config(self.config_path, self.settings.docker_image)
         tail = (out or "").splitlines()[-1] if out else ""
         self.message = f"check={'OK' if ok else 'FAIL'} {tail}"
 
     def do_restart(self) -> None:
         """Restart the sing-box Docker container."""
-        ok, out = docker_restart(self.container)
+        ok, out = docker_restart(self.settings.container)
         tail = (out or "").strip()
         self.message = f"restart={'OK' if ok else 'FAIL'} {tail}"
 
@@ -1215,37 +1240,27 @@ def main() -> None:
     ap.add_argument(
         "--config",
         type=Path,
-        default=Path(DEFAULT_CONFIG),
+        default=None,
         metavar="PATH",
         help=f"Path to sing-box config.json (default: {DEFAULT_CONFIG})",
     )
     ap.add_argument(
         "--clients-table",
         type=Path,
-        default=Path(DEFAULT_TABLE),
+        default=None,
         metavar="PATH",
         dest="clients_table",
         help=f"Path to clientsTable.json (default: {DEFAULT_TABLE})",
     )
-    ap.add_argument(
-        "--vless-tag",
-        default=DEFAULT_TAG,
-        metavar="TAG",
-        help=f"VLESS inbound tag to update (default: {DEFAULT_TAG}; fallback: first VLESS)",
-    )
-    ap.add_argument(
-        "--container",
-        default=DEFAULT_CONTAINER,
-        metavar="NAME",
-        help=f"Docker container name to restart (default: {DEFAULT_CONTAINER})",
-    )
     args = ap.parse_args()
 
-    curses.wrapper(
-        lambda stdscr: App(
-            stdscr, args.config, args.clients_table, args.vless_tag, args.container
-        ).run()
-    )
+    settings = load_settings(DEFAULT_SETTINGS_PATH)
+    if args.config is not None:
+        settings = replace(settings, config_path=args.config)
+    if args.clients_table is not None:
+        settings = replace(settings, clients_table=args.clients_table)
+
+    curses.wrapper(lambda stdscr: App(stdscr, settings).run())
 
 
 if __name__ == "__main__":
