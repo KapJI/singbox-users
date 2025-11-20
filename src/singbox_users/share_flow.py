@@ -6,6 +6,7 @@ import base64
 import importlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -102,6 +103,8 @@ class ShareFlow:
 
     def _copy_to_clipboard(self, text: str) -> None:
         data = text.encode("utf-8")
+        if self._copy_via_tmux(data):
+            return
         b64 = base64.b64encode(data).decode("ascii")
         if len(b64) > OSC52_MAX_PAYLOAD:
             raise RuntimeError("clipboard payload exceeds OSC-52 limits")
@@ -185,3 +188,20 @@ class ShareFlow:
         except ImportError:
             return None
         return qrcode_module, constants.ERROR_CORRECT_L, pil.PilImage
+
+    def _copy_via_tmux(self, data: bytes) -> bool:
+        if not os.environ.get("TMUX"):
+            return False
+        cmd = [
+            "tmux",
+            "load-buffer",
+            "-w",
+            "-b",
+            "singbox-users",
+            "-",
+        ]
+        try:
+            result = subprocess.run(cmd, input=data, check=False)
+        except OSError:
+            return False
+        return result.returncode == 0
