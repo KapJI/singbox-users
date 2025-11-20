@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import base64
-import importlib
-import io
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 from typing import TYPE_CHECKING
+
+from imgcat import imgcat  # type: ignore[import-untyped]
+from qrcode import QRCode
+from qrcode.constants import ERROR_CORRECT_L
+from qrcode.image.pil import PilImage
 
 from singbox_users.settings import (
     DEFAULT_SETTINGS_PATH,
@@ -28,7 +30,6 @@ from singbox_users.share_payload import (
 if TYPE_CHECKING:
     from collections.abc import Callable
     from contextlib import AbstractContextManager
-    from types import ModuleType
 
     from singbox_users.ui.dialogs import ModalManager
 
@@ -141,37 +142,30 @@ class ShareFlow:
     def _display_qr_series(self, vpn_url: str, payloads: list[str]) -> str:
         if not payloads:
             return "No QR payloads to display."
-        backend = self._load_qrcode_backend()
-        if backend is None:
-            return "qrcode dependency missing. Install 'qrcode' extras."
-        qrcode_module, error_correct_l, pil_image = backend
-        imgcat = shutil.which("imgcat")
-        if not imgcat:
-            return "imgcat command not found in PATH."
 
-        def build_png(payload: str) -> bytes:
-            qr = qrcode_module.QRCode(
-                error_correction=error_correct_l,
+        def build_image(payload: str) -> PilImage:
+            qr = QRCode(
+                error_correction=ERROR_CORRECT_L,
                 box_size=6,
                 border=2,
             )
             qr.add_data(payload)
             qr.make(fit=True)
-            img = qr.make_image(
-                image_factory=pil_image,
+            return qr.make_image(
+                image_factory=PilImage,
                 fill_color="black",
                 back_color="white",
             )
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            return buf.getvalue()
 
         with self.suspend_curses():
             print("Share link:", vpn_url, "\n", flush=True)
             total = len(payloads)
             for idx, payload in enumerate(payloads, 1):
-                png = build_png(payload)
-                subprocess.run([imgcat], input=png, check=False)
+                img = build_image(payload)
+                try:
+                    imgcat(img.get_image(), height=20)
+                except (OSError, RuntimeError) as exc:
+                    return f"imgcat rendering failed: {exc}"
                 print(f"[QR {idx}/{total}] {len(payload)} chars", flush=True)
                 if idx < total:
                     resp = input("Press Enter for next QR (q to stop): ")
@@ -179,15 +173,6 @@ class ShareFlow:
                         break
             input("Press Enter to return to singbox-users...")
         return "QR display finished."
-
-    def _load_qrcode_backend(self) -> tuple[ModuleType, int, type[object]] | None:
-        try:
-            qrcode_module = importlib.import_module("qrcode")
-            constants = importlib.import_module("qrcode.constants")
-            pil = importlib.import_module("qrcode.image.pil")
-        except ImportError:
-            return None
-        return qrcode_module, constants.ERROR_CORRECT_L, pil.PilImage
 
     def _copy_via_tmux(self, data: bytes) -> bool:
         if not os.environ.get("TMUX"):

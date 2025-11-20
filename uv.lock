@@ -51,6 +51,12 @@ wheels = [
 ]
 
 [[package]]
+name = "imgcat"
+version = "0.6.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9c/fa/c09733cb5f8a793d2429d06c510a9eaa605fc14381de6701c2df6be69502/imgcat-0.6.0.tar.gz", hash = "sha256:b3547b68adb3f1f9b611390e804c94ebd464a215858543cbf97df86fbcd7935c", size = 12681, upload-time = "2024-11-21T13:36:26.072Z" }
+
+[[package]]
 name = "isort"
 version = "7.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -262,6 +268,7 @@ name = "singbox-users"
 version = "0.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "imgcat" },
     { name = "qrcode", extra = ["pil"] },
 ]
 
@@ -276,7 +283,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "qrcode", extras = ["pil"], specifier = ">=8.2" }]
+requires-dist = [
+    { name = "imgcat", specifier = ">=0.6.0" },
+    { name = "qrcode", extras = ["pil"], specifier = ">=8.2" },
+]
 
 [package.metadata.requires-dev]
 dev = [
