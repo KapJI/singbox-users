@@ -112,10 +112,10 @@ class ModalManager:
                 if ch in (27, 3):
                     result = None
                     return True
-                if ch in (curses.KEY_LEFT, ord("h")):
+                if ch == curses.KEY_LEFT:
                     cursor = max(0, cursor - 1)
                     return False
-                if ch in (curses.KEY_RIGHT, ord("l")):
+                if ch == curses.KEY_RIGHT:
                     cursor = min(len(value), cursor + 1)
                     return False
                 if ch in (curses.KEY_HOME, CTRL_A):
