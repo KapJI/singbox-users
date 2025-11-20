@@ -6,8 +6,8 @@ Manages:
     - config.json (updates VLESS inbound users array)
 
 UI keys:
-    ↑/↓/PgUp/PgDn  move      a add        e rename      d delete
-    s save         S save+restart          c check       x restart
+    ↑/↓/PgUp/PgDn  move      a add        e rename      g share link/QR
+    d delete       s save    S save+restart     c check       x restart
     r reload       q quit (asks to save if dirty)      Ctrl-C behaves like q
 
 Notes:
@@ -16,27 +16,46 @@ Notes:
 """
 
 import argparse
+import base64
 from collections.abc import Callable, Iterator, Sequence
 import contextlib
 import curses
 from dataclasses import dataclass, fields, replace
 from datetime import datetime
+import io
 import json
+import math
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import time
 import tomllib
 from typing import TypedDict, cast
 import uuid
+import zlib
+
+import qrcode
+from qrcode.constants import ERROR_CORRECT_L
+from qrcode.image.pil import PilImage
 
 DEFAULT_CONFIG = Path("/opt/singbox/config.json")
 DEFAULT_TABLE = Path("/opt/singbox/clientsTable.json")
 DEFAULT_TAG = "vless-in"
 DEFAULT_FLOW = "xtls-rprx-vision"
 DEFAULT_CONTAINER = "singbox"
-DEFAULT_SETTINGS = "singbox-manage.toml"
+DEFAULT_SETTINGS = "settings.toml"
 DEFAULT_DOCKER_IMAGE = "ghcr.io/sagernet/sing-box:latest"
+DEFAULT_SHARE_DESCRIPTION = "Proxy Server"
+DEFAULT_SHARE_DNS1 = "1.1.1.1"
+DEFAULT_SHARE_DNS2 = "1.0.0.1"
+DEFAULT_SERVER_PORT = 443
+DEFAULT_SERVER_SNI = "www.googletagmanager.com"
+DEFAULT_QR_CHUNK_SIZE = 850
+MAX_QR_CHUNKS = 255
+MIN_SERVER_PORT = 1
+MAX_SERVER_PORT = 65535
+OSC52_MAX_PAYLOAD = 120000
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_SETTINGS_PATH = SCRIPT_DIR / DEFAULT_SETTINGS
 KEY_BYTE_MAX = 256  # upper bound for single-byte key values
@@ -44,6 +63,9 @@ CTRL_A = 1
 CTRL_E = 5
 CTRL_K = 11
 CTRL_U = 21
+QR_MAGIC_QINT16 = 1984
+MARK_BOLD_ON = "\x01"  # simple inline markup for emphasis
+MARK_BOLD_OFF = "\x02"
 
 with contextlib.suppress(AttributeError):
     curses.set_escdelay(25)  # lower ESC detection delay for snappier cancel
@@ -90,6 +112,14 @@ class Settings:
     docker_image: str = DEFAULT_DOCKER_IMAGE
     config_path: Path = DEFAULT_CONFIG
     clients_table: Path = DEFAULT_TABLE
+    server_ip: str = ""
+    server_pubkey: str = ""
+    server_short_id: str = ""
+    share_description: str = DEFAULT_SHARE_DESCRIPTION
+    share_dns1: str = DEFAULT_SHARE_DNS1
+    share_dns2: str = DEFAULT_SHARE_DNS2
+    server_port: int = DEFAULT_SERVER_PORT
+    server_sni: str = DEFAULT_SERVER_SNI
 
 
 class ClientUserData(TypedDict, total=False):
@@ -129,6 +159,10 @@ class SingBoxConfig(TypedDict, total=False):
 
 
 JSONData = SingBoxConfig | list[ClientEntry]
+type JSONValue = (
+    str | int | float | bool | None | dict[str, "JSONValue"] | list["JSONValue"]
+)
+type JSONObject = dict[str, JSONValue]
 
 
 def default_config() -> SingBoxConfig:
@@ -141,6 +175,139 @@ def default_clients() -> list[ClientEntry]:
     """Return an empty clients table list."""
 
     return []
+
+
+def qcompress(payload: bytes, level: int = 8) -> bytes:
+    """Qt-compatible qCompress wrapper (length prefix + zlib)."""
+
+    return struct.pack(">I", len(payload)) + zlib.compress(payload, level)
+
+
+def vpn_url_from_qcompressed(qc: bytes) -> str:
+    """Return vpn:// URL representation derived from qCompressed bytes."""
+
+    token = base64.urlsafe_b64encode(qc).decode().rstrip("=")
+    return f"vpn://{token}"
+
+
+def make_qr_chunks(qc: bytes, chunk_size: int = DEFAULT_QR_CHUNK_SIZE) -> list[str]:
+    """Split qCompressed bytes into Base64 payloads matching Amnezia QR format."""
+
+    total = len(qc)
+    chunks = max(1, math.ceil(total / chunk_size))
+    if chunks > MAX_QR_CHUNKS:
+        raise ValueError(
+            f"Too many chunks ({chunks}); increase chunk size from {chunk_size}"
+        )
+    payloads: list[str] = []
+    for idx, start in enumerate(range(0, total, chunk_size)):
+        part = qc[start : start + chunk_size]
+        buf = bytearray()
+        buf += struct.pack(">h", QR_MAGIC_QINT16)
+        buf += struct.pack(">B", chunks)
+        buf += struct.pack(">B", idx)
+        buf += struct.pack(">I", len(part))
+        buf += part
+        payloads.append(base64.urlsafe_b64encode(bytes(buf)).decode().rstrip("="))
+    return payloads
+
+
+def build_inner_share_config(
+    server_ip: str,
+    client_id: str,
+    server_pubkey: str,
+    server_short_id: str,
+    *,
+    port: int,
+    server_name: str,
+) -> JSONObject:
+    """Return the Amnezia inner xray config for a single client."""
+
+    return {
+        "log": {"loglevel": "error"},
+        "inbounds": [
+            {
+                "listen": "127.0.0.1",
+                "port": 10808,
+                "protocol": "socks",
+                "settings": {"udp": True},
+            }
+        ],
+        "outbounds": [
+            {
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [
+                        {
+                            "address": server_ip,
+                            "port": port,
+                            "users": [
+                                {
+                                    "id": client_id,
+                                    "flow": "xtls-rprx-vision",
+                                    "encryption": "none",
+                                }
+                            ],
+                        }
+                    ]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "fingerprint": "chrome",
+                        "serverName": server_name,
+                        "publicKey": server_pubkey,
+                        "shortId": server_short_id,
+                        "spiderX": "",
+                    },
+                },
+            }
+        ],
+    }
+
+
+def build_outer_share_config(
+    server_ip: str,
+    client_id: str,
+    server_pubkey: str,
+    server_short_id: str,
+    *,
+    description: str,
+    dns1: str,
+    dns2: str,
+    container: str,
+    port: int,
+    server_name: str,
+) -> JSONObject:
+    """Wrap the inner xray config into Amnezia's outer JSON structure."""
+
+    inner = build_inner_share_config(
+        server_ip,
+        client_id,
+        server_pubkey,
+        server_short_id,
+        port=port,
+        server_name=server_name,
+    )
+    last_config_str = json.dumps(inner, indent=4, ensure_ascii=False) + "\n"
+    return {
+        "containers": [
+            {
+                "container": container,
+                "xray": {
+                    "last_config": last_config_str,
+                    "port": str(port),
+                    "transport_proto": "tcp",
+                },
+            }
+        ],
+        "defaultContainer": container,
+        "description": description,
+        "dns1": dns1,
+        "dns2": dns2,
+        "hostName": server_ip,
+    }
 
 
 def load_settings(path: Path) -> Settings:
@@ -156,11 +323,18 @@ def load_settings(path: Path) -> Settings:
         raise SystemExit(f"ERROR: cannot parse settings at {path}: {e}") from e
     if not isinstance(data, dict):
         raise SystemExit(f"ERROR: settings file {path} must contain a TOML table.")
-    overrides: dict[str, str | Path] = {}
+    overrides: dict[str, object] = {}
     for field in fields(Settings):
         key = field.name
         raw = data.get(key)
         if raw is None:
+            continue
+        if key == "server_port":
+            if not isinstance(raw, int):
+                raise SystemExit(
+                    f"ERROR: value for '{key}' in {path} must be an integer, got {type(raw)!r}."
+                )
+            overrides[key] = raw
             continue
         if not isinstance(raw, str):
             raise SystemExit(
@@ -516,6 +690,35 @@ class App:
             )
             self.stdscr.addnstr(start_y + idx, 0, line, width - 1, attr)
 
+    def _visible_length(self, text: str) -> int:
+        """Return printable width of text, ignoring inline markup tokens."""
+
+        return sum(ch not in (MARK_BOLD_ON, MARK_BOLD_OFF) for ch in text)
+
+    def _addnstr_with_markup(
+        self,
+        window: curses.window,
+        y: int,
+        x: int,
+        text: str,
+        max_width: int,
+    ) -> None:
+        """Render text honoring inline bold markers within modal strings."""
+
+        col = 0
+        attr = 0
+        for ch in text:
+            if col >= max_width:
+                break
+            if ch == MARK_BOLD_ON:
+                attr = curses.A_BOLD
+                continue
+            if ch == MARK_BOLD_OFF:
+                attr = 0
+                continue
+            window.addnstr(y, x + col, ch, 1, attr)
+            col += 1
+
     def _format_client_row(self, index: int, client: ClientEntry) -> str:
         uid = (client.get("clientId") or "")[:36]
         user_data = client.get("userData") or {}
@@ -722,6 +925,19 @@ class App:
             self.stdscr.touchwin()
             self.stdscr.refresh()
 
+    @contextlib.contextmanager
+    def _temporary_terminal_mode(self) -> Iterator[None]:
+        """Suspend curses to let external commands draw directly to the terminal."""
+
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            yield
+        finally:
+            curses.reset_prog_mode()
+            self.stdscr.touchwin()
+            self.stdscr.refresh()
+
     def _modal_loop(
         self,
         window: curses.window,
@@ -748,13 +964,20 @@ class App:
     ) -> None:
         window.erase()
         window.border()
-        window.addnstr(1, 2, spec.header[: width - 4], width - 4)
+        self._addnstr_with_markup(window, 1, 2, spec.header, width - 4)
         for idx, line in enumerate(spec.body_lines):
             y = 2 + idx
             if y >= height - 2:
                 break
-            window.addnstr(y, 2, line[: width - 4], width - 4)
+            self._addnstr_with_markup(
+                window,
+                y,
+                2,
+                line,
+                width - 4,
+            )
         if spec.footer:
+            # Footer intentionally renders raw text — no markup support.
             window.addnstr(
                 height - 2, 2, spec.footer[: width - 4], width - 4, curses.A_DIM
             )
@@ -811,6 +1034,9 @@ class App:
             CommandBinding("PgDn next page", (curses.KEY_NPAGE,), move(10)),
             CommandBinding("a add", (ord("a"), ord("A")), run(self.add_client)),
             CommandBinding("e rename", (ord("e"), ord("E")), run(self.rename_client)),
+            CommandBinding(
+                "g share link/QR", (ord("g"), ord("G")), run(self.share_current_client)
+            ),
             CommandBinding("d delete", (ord("d"), ord("D")), run(self.delete_client)),
             CommandBinding("s save", (ord("s"),), run(self.apply_and_save)),
             CommandBinding("S save and restart", (ord("S"),), save_and_restart),
@@ -966,7 +1192,7 @@ class App:
         text = f"{prompt_text}"
         hint = f"[{'/'.join(choices)}]"
         spec = ModalSpec(header=text, body_lines=[hint], footer="Esc cancel")
-        inner_width = max(len(text) + len(hint) + 6, 30)
+        inner_width = max(self._visible_length(text) + len(hint) + 6, 30)
         result: str | None = None
 
         with self._modal_window(
@@ -1004,20 +1230,29 @@ class App:
         if not buttons:
             return None
 
+        prompt_lines = prompt_text.splitlines() or [""]
+        header_line = prompt_lines[0]
+        body_lines = ["", *prompt_lines[1:]]
+        if body_lines[-1] != "":
+            body_lines.append("")
+        button_row_y = 2 + len(body_lines)
+        desired_height = max(5, len(body_lines) + 4)
         button_tokens = [f"[ {label} ]" for label, _ in buttons]
         buttons_line = " ".join(button_tokens)
-        instructions = "←/→ select · Enter confirm · Esc cancel"
+        longest_prompt_line = max(self._visible_length(line) for line in prompt_lines)
         inner_width = max(
-            len(prompt_text) + 4, len(buttons_line) + 4, len(instructions) + 4, 36
+            longest_prompt_line + 4,
+            len(buttons_line) + 6,
+            36,
         )
         result: str | None = None
         selected = 0
 
         with self._modal_window(
             inner_width,
-            6,
+            desired_height,
             min_width=36,
-            min_height=6,
+            min_height=5,
         ) as (win, height, width):
 
             def redraw_buttons() -> None:
@@ -1026,12 +1261,17 @@ class App:
                     width,
                     height,
                     ModalSpec(
-                        header=prompt_text,
-                        body_lines=[""],
-                        footer=instructions,
+                        header=header_line,
+                        body_lines=body_lines,
                     ),
                 )
-                self._draw_button_row(win, 3, width, button_tokens, selected)
+                self._draw_button_row(
+                    win,
+                    button_row_y,
+                    width,
+                    button_tokens,
+                    selected,
+                )
 
             def redraw() -> None:
                 redraw_buttons()
@@ -1095,10 +1335,9 @@ class App:
             self.message = "No clients."
             return
         cur = self.clients[self.cursor]
-        uid = cur.get("clientId", "")
         name = (cur.get("userData") or {}).get("clientName", "")
         ans = self.prompt_buttons(
-            f"Delete {name} ({uid})?",
+            f"Delete {MARK_BOLD_ON}{name}{MARK_BOLD_OFF}?",
             [
                 ("Delete", "y"),
                 ("Cancel", "c"),
@@ -1170,6 +1409,149 @@ class App:
         ok, out = docker_restart(self.settings.container)
         tail = (out or "").strip()
         self.message = f"restart={'OK' if ok else 'FAIL'} {tail}"
+
+    def share_current_client(self) -> None:
+        """Generate a vpn:// link and optional QR codes for the selected client."""
+        if not self.clients:
+            self.message = "No clients."
+            return
+        client = self.clients[self.cursor]
+        client_id = client.get("clientId") or ""
+        if not client_id:
+            self.message = "Selected client has no UUID."
+            return
+        try:
+            vpn_url, qr_payloads = self._build_share_payload(client_id)
+        except ValueError as e:
+            self.message = str(e)
+            return
+        show_qr, status = self._show_share_modal(vpn_url)
+        self.message = status
+        if show_qr:
+            self._display_qr_series(vpn_url, qr_payloads)
+
+    def _build_share_payload(self, client_id: str) -> tuple[str, list[str]]:
+        missing: list[str] = []
+        server_ip = self.settings.server_ip
+        server_pubkey = self.settings.server_pubkey
+        server_short_id = self.settings.server_short_id
+        if not server_ip:
+            missing.append("server_ip")
+        if not server_pubkey:
+            missing.append("server_pubkey")
+        if not server_short_id:
+            missing.append("server_short_id")
+        if missing:
+            joined = ", ".join(missing)
+            raise ValueError(
+                f"Missing settings for share command: {joined}. Update {DEFAULT_SETTINGS_PATH}"
+            )
+        dns1 = self.settings.share_dns1
+        dns2 = self.settings.share_dns2
+        container = self.settings.container
+        server_port = self.settings.server_port
+        if not MIN_SERVER_PORT <= server_port <= MAX_SERVER_PORT:
+            raise ValueError(
+                f"Server_port must be between {MIN_SERVER_PORT} and {MAX_SERVER_PORT}."
+            )
+        server_name = self.settings.server_sni or DEFAULT_SERVER_SNI
+        outer = build_outer_share_config(
+            server_ip,
+            client_id,
+            server_pubkey,
+            server_short_id,
+            description=self.settings.share_description,
+            dns1=dns1,
+            dns2=dns2,
+            container=container,
+            port=server_port,
+            server_name=server_name,
+        )
+        outer_json = json.dumps(outer, indent=4, ensure_ascii=False) + "\n"
+        qc = qcompress(outer_json.encode("utf-8"), level=8)
+        url = vpn_url_from_qcompressed(qc)
+        try:
+            qr_payloads = make_qr_chunks(qc)
+        except ValueError as e:
+            raise ValueError(f"Failed to split QR chunks: {e}") from e
+        return url, qr_payloads
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        data = text.encode("utf-8")
+        b64 = base64.b64encode(data).decode("ascii")
+        if len(b64) > OSC52_MAX_PAYLOAD:
+            raise RuntimeError("clipboard payload exceeds OSC-52 limits")
+        osc_sequence = f"\033]52;c;{b64}\a"
+        try:
+            with Path("/dev/tty").open("w", encoding="utf-8") as tty:
+                tty.write(osc_sequence)
+                tty.flush()
+        except OSError as exc:
+            raise RuntimeError(f"clipboard unavailable ({exc})") from exc
+
+    def _show_share_modal(self, vpn_url: str) -> tuple[bool, str]:
+        """Display share actions and return (show_qr, status_message)."""
+
+        header = "Client config ready."
+        status_line = "Cancelled."
+
+        while True:
+            result = self.prompt_buttons(
+                f"{header}",
+                [("Copy link", "copy"), ("Show QR", "show"), ("Close", "close")],
+            )
+            if result == "copy":
+                try:
+                    self._copy_to_clipboard(vpn_url)
+                    header = "Share link copied to clipboard."
+                    status_line = header
+                except RuntimeError as exc:
+                    header = str(exc)
+                    status_line = header
+                continue
+            if result == "show":
+                return True, ""
+            return False, status_line
+
+    def _display_qr_series(self, vpn_url: str, payloads: Sequence[str]) -> None:
+        if not payloads:
+            self.message = "No QR payloads to display."
+            return
+        imgcat = shutil.which("imgcat")
+        if not imgcat:
+            self.message = "imgcat command not found in PATH."
+            return
+
+        def build_png(payload: str) -> bytes:
+            qr = qrcode.QRCode(
+                error_correction=ERROR_CORRECT_L,
+                box_size=6,
+                border=2,
+            )
+            qr.add_data(payload)
+            qr.make(fit=True)
+            img = qr.make_image(
+                image_factory=PilImage,
+                fill_color="black",
+                back_color="white",
+            )
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+
+        with self._temporary_terminal_mode():
+            print("Share link:", vpn_url, "\n", flush=True)
+            total = len(payloads)
+            for idx, payload in enumerate(payloads, 1):
+                png = build_png(payload)
+                subprocess.run([imgcat], input=png, check=False)
+                print(f"[QR {idx}/{total}] {len(payload)} chars", flush=True)
+                if idx < total:
+                    resp = input("Press Enter for next QR (q to stop): ")
+                    if resp.strip().lower().startswith("q"):
+                        break
+            input("Press Enter to return to singbox-manage...")
+        self.message = "QR display finished."
 
     def move_cursor(self, delta: int, wrap: bool = False) -> None:
         """Move selection cursor by delta, optionally wrapping around list bounds."""
