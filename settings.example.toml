@@ -5,9 +5,25 @@
 #   container      - Docker container name to restart after saving.
 #   docker_image   - Image used for config checks (docker run ... check).
 #   vless_tag      - Tag of the VLESS inbound to manage.
+#   server_ip      - Host/IP encoded into generated vpn:// links.
+#   server_port        - Reality port encoded into generated configs.
+#   server_sni         - Reality server name (SNI) for the share links.
+#   server_pubkey  - Reality public key for share links.
+#   server_short_id- Reality short ID.
+#   share_description  - Friendly label shown in clients.
+#   share_dns1/share_dns2 - DNS overrides for shared configs.
 
 config_path = "/opt/singbox/config.json"
 clients_table = "/opt/singbox/clientsTable.json"
 container = "singbox"
 docker_image = "ghcr.io/sagernet/sing-box:latest"
 vless_tag = "vless-in"
+
+server_ip = "203.0.113.10"
+server_port = 4443
+server_sni = "www.googletagmanager.com"
+server_pubkey = "MIG..."
+server_short_id = "1234567890abcdef"
+share_description = "Amsterdam #1"
+share_dns1 = "1.1.1.1"
+share_dns2 = "1.0.0.1"

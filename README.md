@@ -7,17 +7,26 @@ checks and restarts behave the same way they do in production.
 ## Quick Start
 
 ```bash
-chmod +x singbox-manage.py
-./singbox-manage.py [--config PATH] [--clients-table PATH]
+uv sync
+sudo ./install.sh             # installs /usr/local/bin/singbox-manage by default
+singbox-manage [--config PATH] [--clients-table PATH]
 ```
 
-Run from any working directory; the script always looks for `singbox-manage.toml` next to
-`singbox-manage.py`. CLI flags override whatever is in that file, so you can point at ad-hoc JSON
-paths without editing the config.
+Prefer not to symlink? Run it ad-hoc with `uv run ./singbox-manage.py ...`. The script always looks
+for `settings.toml` next to `singbox-manage.py`, no matter where you launch it from. CLI flags
+override whatever is in that file, so you can point at ad-hoc JSON paths without editing the config.
+
+### Dependencies
+
+- Python 3.12+
+- [`uv`](https://docs.astral.sh/uv/) for dependency resolution (`uv sync`)
+- [`qrcode[pil]`](https://pypi.org/project/qrcode/) (installed via `uv`) for QR rendering
+- [`imgcat`](https://iterm2.com/utilities/imgcat) from the iTerm2 tools (optional) to preview QR
+  codes inline
 
 ### Settings file
 
-Copy `settings.example.toml` to `singbox-manage.toml` and tweak the values:
+Copy `settings.example.toml` to `settings.toml` and tweak the values:
 
 ```toml
 config_path = "/opt/singbox/config.json"
@@ -25,6 +34,15 @@ clients_table = "/opt/singbox/clientsTable.json"
 vless_tag = "vless-in"
 container = "singbox"
 docker_image = "ghcr.io/sagernet/sing-box:latest"
+
+server_ip = "203.0.113.10"
+server_port = 4443
+server_sni = "www.googletagmanager.com"
+server_pubkey = "MIG..."
+server_short_id = "1234567890abcdef"
+share_description = "Amsterdam #1"
+share_dns1 = "1.1.1.1"
+share_dns2 = "1.0.0.1"
 ```
 
 Leave any key out to inherit the defaults shown above. Flags `--config` / `--clients-table` take
@@ -37,6 +55,8 @@ Key meanings:
 - `vless_tag`: Which inbound's users array is synced.
 - `container`: Container restarted by `S`/`x`.
 - `docker_image`: Image pulled for the `docker run ... check` command.
+- `server_*`: Values injected into generated Amnezia configs for the share dialog (`g`).
+- `share_description`, `share_dns*`: Additional metadata for the exported config.
 
 ## Why use it?
 
@@ -58,6 +78,7 @@ Key meanings:
 | `r`                       | Reload from disk                  |
 | `c`                       | Docker config check               |
 | `x`                       | Docker restart                    |
+| `g`                       | Copy vpn:// link and show QR code |
 | `q`/`Ctrl-C`              | Quit (asks to save if dirty)      |
 
 ## Files it touches
