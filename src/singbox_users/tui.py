@@ -286,8 +286,8 @@ class App:
             return
         users = users_from_clients_table(self.clients)
 
-        b1 = backup(self.table_file)
-        b2 = backup(self.config_file)
+        backup(self.table_file)
+        backup(self.config_file)
 
         atomic_write_json(self.table_file, self.clients)
         inbounds = self.config.get("inbounds", [])
@@ -296,30 +296,35 @@ class App:
         atomic_write_json(self.config_file, self.config)
 
         self.dirty = False
-        backup_notes: list[str] = []
-        if b1:
-            rel = b1.relative_to(self.table_file.parent)
-            backup_notes.append(f"table→{rel}")
-        if b2:
-            rel = b2.relative_to(self.config_file.parent)
-            backup_notes.append(f"config→{rel}")
-
-        if backup_notes:
-            self.message = "Saved. Backups: " + ", ".join(backup_notes)
-        else:
-            self.message = "Saved."
+        self.message = "Saved."
 
     def do_check(self) -> None:
         """Validate the sing-box configuration using Docker."""
+        if not self._ensure_saved_before("running Docker check", "Check cancelled."):
+            return
         ok, out = check_config(self.config_path, self.settings.docker_image)
-        tail = (out or "").splitlines()[-1] if out else ""
-        self.message = f"check={'OK' if ok else 'FAIL'} {tail}"
+        visible = self._format_command_output(out)
+        summary = "OK" if ok else "FAIL"
+        self.modal.prompt_buttons(
+            f"Docker check result: {summary}\n{visible}",
+            [("Close", "close")],
+        )
+        self.message = f"Config check: {summary}"
 
     def do_restart(self) -> None:
         """Restart the sing-box Docker container."""
+        if not self._ensure_saved_before(
+            "restarting the sing-box container", "Restart cancelled."
+        ):
+            return
         ok, out = restart_container(self.settings.container)
-        tail = (out or "").strip()
-        self.message = f"restart={'OK' if ok else 'FAIL'} {tail}"
+        visible = self._format_command_output(out)
+        summary = "OK" if ok else "FAIL"
+        self.modal.prompt_buttons(
+            f"Docker restart result: {summary}\n{visible}",
+            [("Close", "close")],
+        )
+        self.message = f"Container restart: {summary}"
 
     def share_current_client(self) -> None:
         """Generate a vpn:// link and optional QR codes for the selected client."""
@@ -381,6 +386,28 @@ class App:
             self.apply_and_save()
             return True
         return ans == "n"
+
+    def _ensure_saved_before(self, action: str, cancel_message: str) -> bool:
+        if not self.dirty:
+            return True
+        ans = self.prompt_buttons(
+            f"Save pending changes before {action}?",
+            [
+                ("Save & Continue", "save"),
+                ("Cancel", "cancel"),
+            ],
+        )
+        if ans == "save":
+            self.apply_and_save()
+            return not self.dirty
+        self.message = cancel_message
+        return False
+
+    def _format_command_output(self, output: str | None) -> str:
+        detail_lines = (output or "").strip().splitlines()
+        if detail_lines:
+            return "\n".join(detail_lines[-5:])
+        return "No output captured."
 
     # ---------- main loop ----------
     def run(self) -> None:

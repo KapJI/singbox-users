@@ -33,7 +33,7 @@ def check_config(config_path: Path, image: str) -> tuple[bool, str]:
         ok = proc.returncode == 0
         return ok, (proc.stdout or "").strip()
     except FileNotFoundError:
-        return True, "docker not found; skipped check"
+        return False, "docker not found; skipped check"
     except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError) as exc:
         return False, f"check error: {exc}"
 
