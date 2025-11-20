@@ -260,7 +260,7 @@ wheels = [
 [[package]]
 name = "singbox-users"
 version = "0.0.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "qrcode", extra = ["pil"] },
 ]

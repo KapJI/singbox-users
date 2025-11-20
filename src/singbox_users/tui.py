@@ -1,74 +1,67 @@
-#!/usr/bin/env python3
-"""singbox-manage.py — TUI (curses) manager for sing-box users.
+"""Curses TUI application for singbox-users."""
 
-Manages:
-    - clientsTable.json (name + created date)
-    - config.json (updates VLESS inbound users array)
-
-UI keys:
-    ↑/↓/PgUp/PgDn  move      a add        e rename      g share link/QR
-    d delete       s save    S save+restart     c check       x restart
-    r reload       q quit (asks to save if dirty)      Ctrl-C behaves like q
-
-Notes:
-    - The tool finds VLESS inbound by tag (default: vless-in) or first VLESS inbound.
-    - Users are written as: { "uuid": clientId, "name": clientName, "flow": FLOW }
-"""
+from __future__ import annotations
 
 import argparse
 import base64
-from collections.abc import Callable, Iterator, Sequence
 import contextlib
 import curses
-from dataclasses import dataclass, fields, replace
-from datetime import datetime
+from dataclasses import dataclass, replace
 import io
 import json
-import math
 from pathlib import Path
 import shutil
-import struct
 import subprocess
-import time
-import tomllib
-from typing import TypedDict, cast
+from typing import TYPE_CHECKING
 import uuid
-import zlib
 
 import qrcode
 from qrcode.constants import ERROR_CORRECT_L
 from qrcode.image.pil import PilImage
 
-DEFAULT_CONFIG = Path("/opt/singbox/config.json")
-DEFAULT_TABLE = Path("/opt/singbox/clientsTable.json")
-DEFAULT_TAG = "vless-in"
-DEFAULT_FLOW = "xtls-rprx-vision"
-DEFAULT_CONTAINER = "singbox"
-DEFAULT_SETTINGS = "settings.toml"
-DEFAULT_DOCKER_IMAGE = "ghcr.io/sagernet/sing-box:latest"
-DEFAULT_SHARE_DESCRIPTION = "Proxy Server"
-DEFAULT_SHARE_DNS1 = "1.1.1.1"
-DEFAULT_SHARE_DNS2 = "1.0.0.1"
-DEFAULT_SERVER_PORT = 443
-DEFAULT_SERVER_SNI = "www.googletagmanager.com"
-DEFAULT_QR_CHUNK_SIZE = 850
-MAX_QR_CHUNKS = 255
-MIN_SERVER_PORT = 1
-MAX_SERVER_PORT = 65535
+from .config import (
+    DEFAULT_CONFIG,
+    DEFAULT_FLOW,
+    DEFAULT_SERVER_SNI,
+    DEFAULT_SETTINGS_PATH,
+    DEFAULT_TABLE,
+    MAX_SERVER_PORT,
+    MIN_SERVER_PORT,
+    ClientEntry,
+    Settings,
+    SingBoxConfig,
+    atomic_write_json,
+    backup,
+    clients_from_config_users,
+    default_clients,
+    default_config,
+    find_vless_inbound,
+    load_settings,
+    now_ctime,
+    read_json,
+    users_from_clients_table,
+)
+from .share import (
+    build_outer_share_config,
+    make_qr_chunks,
+    qcompress,
+    vpn_url_from_qcompressed,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator, Sequence
+
 OSC52_MAX_PAYLOAD = 120000
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_SETTINGS_PATH = SCRIPT_DIR / DEFAULT_SETTINGS
 KEY_BYTE_MAX = 256  # upper bound for single-byte key values
 CTRL_A = 1
 CTRL_E = 5
 CTRL_K = 11
 CTRL_U = 21
-QR_MAGIC_QINT16 = 1984
 MARK_BOLD_ON = "\x01"  # simple inline markup for emphasis
 MARK_BOLD_OFF = "\x02"
 
 with contextlib.suppress(AttributeError):
-    curses.set_escdelay(25)  # lower ESC detection delay for snappier cancel
+    curses.set_escdelay(25)
 
 CATPPUCCIN_MOCHA = {
     "rosewater": "f5e0dc",
@@ -101,392 +94,6 @@ class ModalSpec:
     header: str
     body_lines: Sequence[str]
     footer: str | None = None
-
-
-@dataclass(frozen=True)
-class Settings:
-    """Runtime settings loaded from singbox-manage.toml."""
-
-    vless_tag: str = DEFAULT_TAG
-    container: str = DEFAULT_CONTAINER
-    docker_image: str = DEFAULT_DOCKER_IMAGE
-    config_path: Path = DEFAULT_CONFIG
-    clients_table: Path = DEFAULT_TABLE
-    server_ip: str = ""
-    server_pubkey: str = ""
-    server_short_id: str = ""
-    share_description: str = DEFAULT_SHARE_DESCRIPTION
-    share_dns1: str = DEFAULT_SHARE_DNS1
-    share_dns2: str = DEFAULT_SHARE_DNS2
-    server_port: int = DEFAULT_SERVER_PORT
-    server_sni: str = DEFAULT_SERVER_SNI
-
-
-class ClientUserData(TypedDict, total=False):
-    """User metadata stored alongside each client entry."""
-
-    clientName: str
-    creationDate: str
-
-
-class ClientEntry(TypedDict, total=False):
-    """Representation of a row in clientsTable.json."""
-
-    clientId: str
-    userData: ClientUserData
-
-
-class ConfigUser(TypedDict, total=False):
-    """Sing-box VLESS user entry."""
-
-    uuid: str
-    name: str
-    flow: str
-
-
-class Inbound(TypedDict, total=False):
-    """Sing-box inbound definition."""
-
-    type: str
-    tag: str
-    users: list[ConfigUser]
-
-
-class SingBoxConfig(TypedDict, total=False):
-    """Sing-box configuration root structure."""
-
-    inbounds: list[Inbound]
-
-
-JSONData = SingBoxConfig | list[ClientEntry]
-type JSONValue = (
-    str | int | float | bool | None | dict[str, "JSONValue"] | list["JSONValue"]
-)
-type JSONObject = dict[str, JSONValue]
-
-
-def default_config() -> SingBoxConfig:
-    """Return an empty sing-box configuration structure."""
-
-    return {}
-
-
-def default_clients() -> list[ClientEntry]:
-    """Return an empty clients table list."""
-
-    return []
-
-
-def qcompress(payload: bytes, level: int = 8) -> bytes:
-    """Qt-compatible qCompress wrapper (length prefix + zlib)."""
-
-    return struct.pack(">I", len(payload)) + zlib.compress(payload, level)
-
-
-def vpn_url_from_qcompressed(qc: bytes) -> str:
-    """Return vpn:// URL representation derived from qCompressed bytes."""
-
-    token = base64.urlsafe_b64encode(qc).decode().rstrip("=")
-    return f"vpn://{token}"
-
-
-def make_qr_chunks(qc: bytes, chunk_size: int = DEFAULT_QR_CHUNK_SIZE) -> list[str]:
-    """Split qCompressed bytes into Base64 payloads matching Amnezia QR format."""
-
-    total = len(qc)
-    chunks = max(1, math.ceil(total / chunk_size))
-    if chunks > MAX_QR_CHUNKS:
-        raise ValueError(
-            f"Too many chunks ({chunks}); increase chunk size from {chunk_size}"
-        )
-    payloads: list[str] = []
-    for idx, start in enumerate(range(0, total, chunk_size)):
-        part = qc[start : start + chunk_size]
-        buf = bytearray()
-        buf += struct.pack(">h", QR_MAGIC_QINT16)
-        buf += struct.pack(">B", chunks)
-        buf += struct.pack(">B", idx)
-        buf += struct.pack(">I", len(part))
-        buf += part
-        payloads.append(base64.urlsafe_b64encode(bytes(buf)).decode().rstrip("="))
-    return payloads
-
-
-def build_inner_share_config(
-    server_ip: str,
-    client_id: str,
-    server_pubkey: str,
-    server_short_id: str,
-    *,
-    port: int,
-    server_name: str,
-) -> JSONObject:
-    """Return the Amnezia inner xray config for a single client."""
-
-    return {
-        "log": {"loglevel": "error"},
-        "inbounds": [
-            {
-                "listen": "127.0.0.1",
-                "port": 10808,
-                "protocol": "socks",
-                "settings": {"udp": True},
-            }
-        ],
-        "outbounds": [
-            {
-                "protocol": "vless",
-                "settings": {
-                    "vnext": [
-                        {
-                            "address": server_ip,
-                            "port": port,
-                            "users": [
-                                {
-                                    "id": client_id,
-                                    "flow": "xtls-rprx-vision",
-                                    "encryption": "none",
-                                }
-                            ],
-                        }
-                    ]
-                },
-                "streamSettings": {
-                    "network": "tcp",
-                    "security": "reality",
-                    "realitySettings": {
-                        "fingerprint": "chrome",
-                        "serverName": server_name,
-                        "publicKey": server_pubkey,
-                        "shortId": server_short_id,
-                        "spiderX": "",
-                    },
-                },
-            }
-        ],
-    }
-
-
-def build_outer_share_config(
-    server_ip: str,
-    client_id: str,
-    server_pubkey: str,
-    server_short_id: str,
-    *,
-    description: str,
-    dns1: str,
-    dns2: str,
-    container: str,
-    port: int,
-    server_name: str,
-) -> JSONObject:
-    """Wrap the inner xray config into Amnezia's outer JSON structure."""
-
-    inner = build_inner_share_config(
-        server_ip,
-        client_id,
-        server_pubkey,
-        server_short_id,
-        port=port,
-        server_name=server_name,
-    )
-    last_config_str = json.dumps(inner, indent=4, ensure_ascii=False) + "\n"
-    return {
-        "containers": [
-            {
-                "container": container,
-                "xray": {
-                    "last_config": last_config_str,
-                    "port": str(port),
-                    "transport_proto": "tcp",
-                },
-            }
-        ],
-        "defaultContainer": container,
-        "description": description,
-        "dns1": dns1,
-        "dns2": dns2,
-        "hostName": server_ip,
-    }
-
-
-def load_settings(path: Path) -> Settings:
-    """Load runtime settings from TOML, falling back to defaults when missing."""
-
-    base = Settings()
-    if not path.exists():
-        return base
-    try:
-        with path.open("rb") as f:
-            data = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError) as e:
-        raise SystemExit(f"ERROR: cannot parse settings at {path}: {e}") from e
-    if not isinstance(data, dict):
-        raise SystemExit(f"ERROR: settings file {path} must contain a TOML table.")
-    overrides: dict[str, object] = {}
-    for field in fields(Settings):
-        key = field.name
-        raw = data.get(key)
-        if raw is None:
-            continue
-        if key == "server_port":
-            if not isinstance(raw, int):
-                raise SystemExit(
-                    f"ERROR: value for '{key}' in {path} must be an integer, got {type(raw)!r}."
-                )
-            overrides[key] = raw
-            continue
-        if not isinstance(raw, str):
-            raise SystemExit(
-                f"ERROR: value for '{key}' in {path} must be a string, got {type(raw)!r}."
-            )
-        stripped = raw.strip()
-        if stripped:
-            overrides[key] = Path(stripped) if field.type is Path else stripped
-    return replace(base, **overrides)  # type: ignore[arg-type]
-
-
-def now_ctime() -> str:
-    """Return the current time as a formatted string.
-
-    Returns:
-        str: Current time in standard ctime format.
-    """
-    return time.ctime()
-
-
-def read_json[T_JSON](path: Path, default: T_JSON) -> T_JSON:
-    """Read and parse a JSON file with error handling.
-
-    Args:
-        path (Path): Path to the JSON file.
-        default (T_JSON): Default value to return if file is not found.
-
-    Returns:
-        T_JSON: Parsed JSON data or default value if file doesn't exist.
-
-    Raises:
-        SystemExit: If JSON cannot be parsed.
-    """
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            return cast("T_JSON", json.load(f))
-    except FileNotFoundError:
-        return default
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"ERROR: cannot parse JSON at {path}: {e}") from e
-
-
-def atomic_write_json(path: Path, data: JSONData) -> None:
-    """Write JSON data to file atomically to prevent corruption.
-
-    Creates a temporary file first, then replaces the target file.
-    Creates parent directories if they don't exist.
-
-    Args:
-        path (Path): Target file path.
-        data (JSONData): Data to serialize as JSON.
-    """
-    tmp_path = Path(f"{path}.tmp")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    tmp_path.replace(path)
-
-
-def backup(path: Path) -> Path | None:
-    """Create a timestamped backup of a file.
-
-    Args:
-        path (Path): Path to the file to backup.
-
-    Returns:
-        Path | None: Path to the backup file, or None if original doesn't exist.
-    """
-    if not path.exists():
-        return None
-    ts = datetime.now().strftime("%Y%m%d%H%M%S")
-    backup_dir = path.parent / "backup"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    dst = backup_dir / f"{path.name}.bak.{ts}"
-    shutil.copy2(path, dst)
-    return dst
-
-
-def find_vless_inbound(config: SingBoxConfig, tag: str | None) -> int:
-    """Find the index of a VLESS inbound in the config.
-
-    Searches by tag first if provided, otherwise returns first VLESS inbound.
-
-    Args:
-        config (SingBoxConfig): Parsed sing-box configuration dictionary.
-        tag (str | None): Optional VLESS inbound tag to search for.
-
-    Returns:
-        int: Index of the VLESS inbound in the inbounds array.
-
-    Raises:
-        SystemExit: If no VLESS inbound is found.
-    """
-    inbounds = config.get("inbounds", [])
-    if tag:
-        for i, ib in enumerate(inbounds):
-            if ib.get("type") == "vless" and ib.get("tag") == tag:
-                return i
-    for i, ib in enumerate(inbounds):
-        if ib.get("type") == "vless":
-            return i
-    raise SystemExit("No VLESS inbound found in config.json")
-
-
-def users_from_clients_table(
-    clients: Sequence[ClientEntry], flow: str
-) -> list[ConfigUser]:
-    """Convert clients table entries to sing-box VLESS user format.
-
-    Args:
-        clients (Sequence[ClientEntry]): Client entries from clientsTable.json.
-        flow (str): Flow control setting (e.g., 'xtls-rprx-vision').
-
-    Returns:
-        list[ConfigUser]: Users that can be written into sing-box config.
-    """
-    out: list[ConfigUser] = []
-    for c in clients:
-        uid = c.get("clientId")
-        user_data = c.get("userData") or {}
-        name = user_data.get("clientName", "client")
-        if not uid:
-            continue
-        out.append({"uuid": uid, "name": name, "flow": flow})
-    return out
-
-
-def clients_from_config_users(
-    users: Sequence[ConfigUser],
-) -> list[ClientEntry]:
-    """Convert sing-box VLESS users to clients table format.
-
-    Args:
-        users (Sequence[ConfigUser]): Users from the sing-box config inbound.
-
-    Returns:
-        list[ClientEntry]: Client entries suitable for clientsTable.json.
-    """
-    out: list[ClientEntry] = []
-    for u in users:
-        uid = u.get("uuid")
-        if not uid:
-            continue
-        name = u.get("name") or "imported"
-        out.append(
-            {
-                "clientId": uid,
-                "userData": {"clientName": name, "creationDate": now_ctime()},
-            }
-        )
-    return out
 
 
 def docker_check_config(config_path: Path, image: str) -> tuple[bool, str]:
@@ -1550,7 +1157,7 @@ class App:
                     resp = input("Press Enter for next QR (q to stop): ")
                     if resp.strip().lower().startswith("q"):
                         break
-            input("Press Enter to return to singbox-manage...")
+            input("Press Enter to return to singbox-users...")
         self.message = "QR display finished."
 
     def move_cursor(self, delta: int, wrap: bool = False) -> None:

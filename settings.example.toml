@@ -1,4 +1,4 @@
-# Copy this file to singbox-manage.toml and adjust values as needed.
+# Copy this file to settings.toml and adjust values as needed.
 # Supported keys:
 #   config_path    - Path to sing-box config.json.
 #   clients_table  - Path to clientsTable.json.
@@ -20,7 +20,7 @@ docker_image = "ghcr.io/sagernet/sing-box:latest"
 vless_tag = "vless-in"
 
 server_ip = "203.0.113.10"
-server_port = 4443
+server_port = 443
 server_sni = "www.googletagmanager.com"
 server_pubkey = "MIG..."
 server_short_id = "1234567890abcdef"

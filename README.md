@@ -8,13 +8,13 @@ checks and restarts behave the same way they do in production.
 
 ```bash
 uv sync
-sudo ./install.sh             # installs /usr/local/bin/singbox-manage by default
-singbox-manage [--config PATH] [--clients-table PATH]
+sudo ./install.sh             # installs /usr/local/bin/singbox-users by default
+singbox-users [--config PATH] [--clients-table PATH]
 ```
 
-Prefer not to symlink? Run it ad-hoc with `uv run ./singbox-manage.py ...`. The script always looks
-for `settings.toml` next to `singbox-manage.py`, no matter where you launch it from. CLI flags
-override whatever is in that file, so you can point at ad-hoc JSON paths without editing the config.
+Prefer not to symlink? Run it ad-hoc with `uv run singbox-users ...`. The CLI always looks for
+`settings.toml` in the repository root, no matter where you launch it from. CLI flags override
+whatever is in that file, so you can point at ad-hoc JSON paths without editing the config.
 
 ### Dependencies
 
@@ -36,7 +36,7 @@ container = "singbox"
 docker_image = "ghcr.io/sagernet/sing-box:latest"
 
 server_ip = "203.0.113.10"
-server_port = 4443
+server_port = 443
 server_sni = "www.googletagmanager.com"
 server_pubkey = "MIG..."
 server_short_id = "1234567890abcdef"
