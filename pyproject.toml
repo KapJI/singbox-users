@@ -1,3 +1,7 @@
+[build-system]
+requires = ["uv_build>=0.9.10,<0.10.0"]
+build-backend = "uv_build"
+
 [project]
 name = "singbox-users"
 version = "0.0.0"
@@ -7,6 +11,9 @@ requires-python = ">=3.12"
 dependencies = [
   "qrcode[pil]>=8.2",
 ]
+
+[project.scripts]
+singbox-users = "singbox_users.tui:main"
 
 [dependency-groups]
 dev = [
