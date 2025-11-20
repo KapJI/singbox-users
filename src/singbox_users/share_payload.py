@@ -12,6 +12,7 @@ import zlib
 if TYPE_CHECKING:
     from .singbox_config import JSONObject
 
+AMNEZIA_XRAY_CONTAINER = "amnezia-xray"
 DEFAULT_QR_CHUNK_SIZE = 850
 MAX_QR_CHUNKS = 255
 QR_MAGIC_QINT16: Final = 1984
@@ -116,7 +117,6 @@ def build_outer_share_config(
     description: str,
     dns1: str,
     dns2: str,
-    container: str,
     port: int,
     server_name: str,
 ) -> JSONObject:
@@ -134,7 +134,7 @@ def build_outer_share_config(
     return {
         "containers": [
             {
-                "container": container,
+                "container": AMNEZIA_XRAY_CONTAINER,
                 "xray": {
                     "last_config": last_config_str,
                     "port": str(port),
@@ -142,7 +142,7 @@ def build_outer_share_config(
                 },
             }
         ],
-        "defaultContainer": container,
+        "defaultContainer": AMNEZIA_XRAY_CONTAINER,
         "description": description,
         "dns1": dns1,
         "dns2": dns2,

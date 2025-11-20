@@ -89,7 +89,6 @@ class ShareFlow:
             description=self.settings.share_description,
             dns1=self.settings.share_dns1,
             dns2=self.settings.share_dns2,
-            container=self.settings.container,
             port=self.settings.server_port,
             server_name=self.settings.server_sni,
         )
