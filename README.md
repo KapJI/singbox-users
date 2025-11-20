@@ -21,8 +21,8 @@ whatever is in that file, so you can point at ad-hoc JSON paths without editing 
 - Python 3.12+
 - [`uv`](https://docs.astral.sh/uv/) for dependency resolution (`uv sync`)
 - [`qrcode[pil]`](https://pypi.org/project/qrcode/) (installed via `uv`) for QR rendering
-- [`imgcat`](https://iterm2.com/utilities/imgcat) from the iTerm2 tools (optional) to preview QR
-  codes inline
+- [`python-imgcat`](https://github.com/wookayin/python-imgcat) for inline QR previews that work in
+  iTerm2, tmux, and other terminals supporting the protocol
 
 ### Settings file
 
