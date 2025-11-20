@@ -6,19 +6,14 @@ import base64
 import json
 import math
 import struct
-from typing import Final
+from typing import TYPE_CHECKING, Final
 import zlib
 
-from .config import (
-    DEFAULT_QR_CHUNK_SIZE,
-    DEFAULT_SERVER_PORT,
-    DEFAULT_SHARE_DESCRIPTION,
-    DEFAULT_SHARE_DNS1,
-    DEFAULT_SHARE_DNS2,
-    MAX_QR_CHUNKS,
-    JSONObject,
-)
+if TYPE_CHECKING:
+    from .singbox_config import JSONObject
 
+DEFAULT_QR_CHUNK_SIZE = 850
+MAX_QR_CHUNKS = 255
 QR_MAGIC_QINT16: Final = 1984
 
 
@@ -63,7 +58,7 @@ def build_inner_share_config(
     server_pubkey: str,
     server_short_id: str,
     *,
-    port: int = DEFAULT_SERVER_PORT,
+    port: int,
     server_name: str,
 ) -> JSONObject:
     """Return the Amnezia inner xray config for a single client."""
@@ -118,11 +113,11 @@ def build_outer_share_config(
     server_pubkey: str,
     server_short_id: str,
     *,
-    description: str = DEFAULT_SHARE_DESCRIPTION,
-    dns1: str = DEFAULT_SHARE_DNS1,
-    dns2: str = DEFAULT_SHARE_DNS2,
+    description: str,
+    dns1: str,
+    dns2: str,
     container: str,
-    port: int = DEFAULT_SERVER_PORT,
+    port: int,
     server_name: str,
 ) -> JSONObject:
     """Wrap the inner xray config into Amnezia's outer JSON structure."""
