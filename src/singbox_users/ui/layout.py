@@ -9,8 +9,8 @@ if TYPE_CHECKING:
     import curses
     from pathlib import Path
 
+    from singbox_users.main import CommandBinding
     from singbox_users.singbox_config import ClientEntry
-    from singbox_users.tui import CommandBinding
 
 
 @dataclass
