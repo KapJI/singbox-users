@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-singbox-users = "singbox_users.tui:main"
+singbox-users = "singbox_users.main:main"
 
 [dependency-groups]
 dev = [
