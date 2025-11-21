@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 import uuid
 
-from .docker_utils import check_config, hup_singbox, restart_container
+from .docker_utils import check_config, restart_container
 from .settings import DEFAULT_SETTINGS_PATH, Settings, load_settings
 from .share_flow import ShareFlow
 from .singbox_config import (
@@ -161,11 +161,6 @@ class App:
             CommandBinding("S save and restart", (ord("S"),), save_and_restart),
             CommandBinding("c check", (ord("c"), ord("C")), run(self.do_check)),
             CommandBinding("x restart", (ord("x"), ord("X")), run(self.do_restart)),
-            CommandBinding(
-                "R reload config",
-                (ord("R"),),
-                run(self.reload_singbox_config),
-            ),
             CommandBinding("r reload", (ord("r"),), run(self.reload_all)),
             CommandBinding("q quit", (ord("q"), ord("Q"), 3), request_quit),
         )
@@ -330,21 +325,6 @@ class App:
             [("Close", "close")],
         )
         self.message = f"Container restart: {summary}"
-
-    def reload_singbox_config(self) -> None:
-        """Send SIGHUP to sing-box so it reloads configuration without restarting."""
-        if not self._ensure_saved_before(
-            "signaling sing-box to reload", "Reload cancelled."
-        ):
-            return
-        ok, out = hup_singbox(self.settings.container)
-        visible = self._format_command_output(out)
-        summary = "OK" if ok else "FAIL"
-        self.modal.prompt_buttons(
-            f"Sing-box reload result: {summary}\n{visible}",
-            [("Close", "close")],
-        )
-        self.message = f"Sing-box reload: {summary}"
 
     def share_current_client(self) -> None:
         """Generate a vpn:// link and optional QR codes for the selected client."""
