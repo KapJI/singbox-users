@@ -34,12 +34,7 @@ clients_table = "/opt/singbox/clientsTable.json"
 vless_tag = "vless-in"
 container = "singbox"
 docker_image = "ghcr.io/sagernet/sing-box:latest"
-
 server_ip = "203.0.113.10"
-server_port = 443
-server_sni = "www.googletagmanager.com"
-server_pubkey = "MIG..."
-server_short_id = "1234567890abcdef"
 share_description = "Amsterdam #1"
 share_dns1 = "1.1.1.1"
 share_dns2 = "1.0.0.1"
@@ -55,7 +50,7 @@ Key meanings:
 - `vless_tag`: Which inbound's users array is synced.
 - `container`: Container restarted by `S`/`x`.
 - `docker_image`: Image pulled for the `docker run ... check` command.
-- `server_*`: Values injected into generated Amnezia configs for the share dialog (`g`).
+- `server_ip`: Server host/IP for the exported config.
 - `share_description`, `share_dns*`: Additional metadata for the exported config.
 
 ## Why use it?

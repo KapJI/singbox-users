@@ -22,8 +22,6 @@ DEFAULT_DOCKER_IMAGE = "ghcr.io/sagernet/sing-box:latest"
 DEFAULT_SHARE_DESCRIPTION = "Proxy Server"
 DEFAULT_SHARE_DNS1 = "1.1.1.1"
 DEFAULT_SHARE_DNS2 = "1.0.0.1"
-DEFAULT_SERVER_PORT = 443
-DEFAULT_SERVER_SNI = "www.googletagmanager.com"
 MIN_SERVER_PORT = 1
 MAX_SERVER_PORT = 65535
 
@@ -38,13 +36,9 @@ class Settings:
     singbox_config: Path = DEFAULT_SINGBOX_CONFIG
     clients_table: Path = DEFAULT_CLIENTS_TABLE
     server_ip: str = ""
-    server_pubkey: str = ""
-    server_short_id: str = ""
     share_description: str = DEFAULT_SHARE_DESCRIPTION
     share_dns1: str = DEFAULT_SHARE_DNS1
     share_dns2: str = DEFAULT_SHARE_DNS2
-    server_port: int = DEFAULT_SERVER_PORT
-    server_sni: str = DEFAULT_SERVER_SNI
 
 
 def load_settings(path: Path) -> Settings:
@@ -65,13 +59,6 @@ def load_settings(path: Path) -> Settings:
         key = field.name
         raw = data.get(key)
         if raw is None:
-            continue
-        if key == "server_port":
-            if not isinstance(raw, int):
-                raise SystemExit(
-                    f"ERROR: value for '{key}' in {path} must be an integer, got {type(raw)!r}."
-                )
-            overrides[key] = raw
             continue
         if not isinstance(raw, str):
             raise SystemExit(
