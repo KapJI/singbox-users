@@ -104,7 +104,12 @@ class App:
         def suspend_fn() -> AbstractContextManager[None]:
             return suspend_curses(self.stdscr)
 
-        self.share_flow = ShareFlow(self.settings, self.modal, suspend_fn)
+        self.share_flow = ShareFlow(
+            self.settings,
+            self.modal,
+            suspend_fn,
+            self.config,
+        )
         with contextlib.suppress(curses.error):
             self.stdscr.bkgd(" ", self.styles.get("background", 0))
 

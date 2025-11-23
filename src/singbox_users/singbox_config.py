@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+from dataclasses import dataclass
 from datetime import datetime
 import json
 from pathlib import Path
 import shutil
 import time
 from typing import TYPE_CHECKING, TypedDict, cast
+
+from nacl.bindings import crypto_scalarmult_base
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -16,6 +21,7 @@ DEFAULT_SINGBOX_CONFIG = Path("/opt/singbox/config.json")
 DEFAULT_CLIENTS_TABLE = Path("/opt/singbox/clientsTable.json")
 DEFAULT_VLESS_TAG = "vless-in"
 DEFAULT_FLOW = "xtls-rprx-vision"
+REALITY_KEY_BYTES = 32
 
 
 class ClientUserData(TypedDict, total=False):
@@ -52,6 +58,16 @@ class SingBoxConfig(TypedDict, total=False):
     """Sing-box configuration root structure."""
 
     inbounds: list[Inbound]
+
+
+@dataclass(frozen=True)
+class ServerSettings:
+    """Subset of Reality/VLESS fields required for share links."""
+
+    port: int
+    server_name: str
+    short_id: str
+    public_key: str
 
 
 JSONData = SingBoxConfig | list[ClientEntry]
@@ -161,3 +177,79 @@ def clients_from_config_users(
             }
         )
     return out
+
+
+def extract_server_settings(config: SingBoxConfig, tag: str | None) -> ServerSettings:
+    """Return Reality parameters from a sing-box VLESS inbound."""
+
+    idx = find_vless_inbound(config, tag)
+    inbounds = config.get("inbounds", [])
+    if idx >= len(inbounds):
+        raise ValueError("VLESS inbound missing from configuration.")
+    inbound = inbounds[idx]
+    port = _coerce_port(inbound.get("listen_port"))
+    if port is None:
+        raise ValueError("listen_port is required on the VLESS inbound.")
+
+    tls = cast("dict[str, object]", inbound.get("tls") or {})
+    reality = cast("dict[str, object]", tls.get("reality") or {})
+    handshake = cast("dict[str, object]", reality.get("handshake") or {})
+
+    server_name = _require_string(
+        handshake.get("server"),
+        "tls.reality.handshake.server",
+    )
+    short_id = _extract_short_id(cast("list[str]", reality.get("short_id") or []))
+    private_key = _require_string(
+        reality.get("private_key"),
+        "tls.reality.private_key",
+    )
+    public_key = _derive_reality_public_key(private_key)
+    return ServerSettings(
+        port=port,
+        server_name=server_name,
+        short_id=short_id,
+        public_key=public_key,
+    )
+
+
+def _coerce_port(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return int(stripped, 10)
+        except ValueError:
+            return None
+    return None
+
+
+def _extract_short_id(ids: list[str]) -> str:
+    if not ids:
+        raise ValueError("tls.reality.short_id must contain at least one value.")
+    return ids[0].strip()
+
+
+def _derive_reality_public_key(private_key: str) -> str:
+    scalar = _decode_base64(private_key)
+    if len(scalar) != REALITY_KEY_BYTES:
+        raise ValueError("Reality private key must decode to 32 bytes.")
+    point = crypto_scalarmult_base(scalar)
+    return base64.urlsafe_b64encode(point).decode("ascii").rstrip("=")
+
+
+def _decode_base64(value: str) -> bytes:
+    padded = value + "=" * (-len(value) % 4)
+    try:
+        return base64.urlsafe_b64decode(padded)
+    except binascii.Error as exc:
+        raise ValueError("Reality key must be base64-encoded.") from exc
+
+
+def _require_string(value: object, label: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise ValueError(f"Missing {label} in config.json.")
